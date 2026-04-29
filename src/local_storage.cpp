@@ -834,6 +834,15 @@ static std::string FindGameInstallPath(const std::string& steamPath, uint32_t ap
     return {};
 }
 
+bool IsAppInstalled(const std::string& steamPath, uint32_t appId) {
+    for (const auto& libPath : GetSteamLibraryPaths(steamPath)) {
+        auto manifestPath = libPath / "steamapps" / ("appmanifest_" + std::to_string(appId) + ".acf");
+        std::error_code ec;
+        if (std::filesystem::exists(manifestPath, ec) && !ec) return true;
+    }
+    return false;
+}
+
 // Corrupt => caller quarantines. Legacy "0" reads as Absent.
 enum class CNParseResult { Absent, Valid, Corrupt };
 

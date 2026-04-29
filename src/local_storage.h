@@ -45,6 +45,8 @@ void SetChangeNumber(uint32_t accountId, uint32_t appId, uint64_t cn);
 uint64_t IncrementChangeNumber(uint32_t accountId, uint32_t appId);
 std::vector<uint8_t> SHA1(const uint8_t* data, size_t len);
 std::string GetAppPath(uint32_t accountId, uint32_t appId);
+// True iff the user has the app's appmanifest_<appid>.acf in any configured Steam library.
+bool IsAppInstalled(const std::string& steamPath, uint32_t appId);
 // scanLimitHit: scan was truncated; callers must not commit an import nor
 //   clear any canonical-token cache (a partial scan is not corruption).
 // hasRootCollision: two rules resolved to the same cloud path under different

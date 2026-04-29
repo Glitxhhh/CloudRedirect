@@ -1618,8 +1618,10 @@ static void UploadPlaytimeOnExit(uint32_t appId) {
             }
         }
     }
-    if (cloudPlaytime2wks == 0 && cloudPlaytime > 0)
-        cloudPlaytime2wks = cloudPlaytime;
+    // Steam decays Playtime2wks; never default it to lifetime total.
+    // Clamp obviously-corrupt blobs (2wks > total) by zeroing 2wks.
+    if (cloudPlaytime2wks > cloudPlaytime)
+        cloudPlaytime2wks = 0;
 
     // Playtime merge: baseline + session, but never less than VDF or cloud
     uint64_t mergedPlaytime = cloudPlaytime + trackedMinutes;
@@ -1632,6 +1634,9 @@ static void UploadPlaytimeOnExit(uint32_t appId) {
         mergedPlaytime2wks = vdfPlaytime2wks;
     if (info.vdfBaseline2wks + trackedMinutes > mergedPlaytime2wks)
         mergedPlaytime2wks = info.vdfBaseline2wks + trackedMinutes;
+    // Never let recent exceed lifetime; safer to under-report than poison cloud.
+    if (mergedPlaytime2wks > mergedPlaytime)
+        mergedPlaytime2wks = mergedPlaytime;
     uint64_t mergedLastPlayed = (lastPlayed > cloudLastPlayed) ? lastPlayed : cloudLastPlayed;
 
     if (mergedPlaytime == 0 && mergedPlaytime2wks == 0 && mergedLastPlayed == 0) {

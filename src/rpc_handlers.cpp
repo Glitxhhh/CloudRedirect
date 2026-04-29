@@ -594,8 +594,9 @@ static void ParsePlaytimeBlob(const std::string& blob, uint64_t& lastPlayed,
             playtime = ParsePlaytimeField(parsed["Playtime"]);
         if (parsed.has("Playtime2wks"))
             playtime2wks = ParsePlaytimeField(parsed["Playtime2wks"]);
-        if (playtime2wks == 0 && playtime > 0)
-            playtime2wks = playtime;
+        // 2wks > lifetime is corruption; zero rather than propagate.
+        if (playtime2wks > playtime)
+            playtime2wks = 0;
         return;
     }
 
@@ -610,8 +611,8 @@ static void ParsePlaytimeBlob(const std::string& blob, uint64_t& lastPlayed,
         else if (key == "Playtime") playtime = strtoull(val.c_str(), nullptr, 10);
         else if (key == "Playtime2wks") playtime2wks = strtoull(val.c_str(), nullptr, 10);
     }
-    if (playtime2wks == 0 && playtime > 0)
-        playtime2wks = playtime;
+    if (playtime2wks > playtime)
+        playtime2wks = 0;
 }
 
 // Per-app root tokens (e.g., "%GameInstall%") seen on uploads.
@@ -1198,6 +1199,13 @@ static void RestorePlaytimeMetadata(uint32_t accountId, uint32_t appId, const st
         });
 
     if (!found) {
+        // Don't fabricate playtime sections for apps the user doesn't own.
+        // Stale cloud blobs from prior installs / SteamTools-injected sessions
+        // would otherwise resurrect ghost playtime in localconfig.vdf every login.
+        if (!LocalStorage::IsAppInstalled(GetSteamPath(), appId)) {
+            LOG("[Playtime] Skipping VDF synthesis for app %u: not installed locally", appId);
+            return;
+        }
         std::string newLP = std::to_string(cloudLastPlayed);
         std::string newPT = std::to_string(cloudPlaytime);
         std::string newPT2 = std::to_string(cloudPlaytime2wks);
@@ -1223,6 +1231,9 @@ static void RestorePlaytimeMetadata(uint32_t accountId, uint32_t appId, const st
     uint64_t mergedLP = (cloudLastPlayed > localLastPlayed) ? cloudLastPlayed : localLastPlayed;
     uint64_t mergedPT = (cloudPlaytime > localPlaytime) ? cloudPlaytime : localPlaytime;
     uint64_t mergedPT2 = (cloudPlaytime2wks > localPlaytime2wks) ? cloudPlaytime2wks : localPlaytime2wks;
+    // Recent playtime cannot exceed lifetime; reject any value that would.
+    if (mergedPT2 > mergedPT)
+        mergedPT2 = localPlaytime2wks <= mergedPT ? localPlaytime2wks : 0;
     if (mergedLP == localLastPlayed && mergedPT == localPlaytime && mergedPT2 == localPlaytime2wks) {
         RestoreInMemoryPlaytimeMetadata(appId, mergedLP, mergedPT, mergedPT2);
         LOG("[Playtime] Local playtime already up-to-date for app %u", appId);
