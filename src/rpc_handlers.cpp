@@ -324,6 +324,8 @@ static void BootstrapAutoCloudFilesWorker(uint32_t accountId, uint32_t appId,
         std::string sourcePath;
         uint64_t timestamp = 0;
         std::string rootToken;
+        bool refresh = false;            // disk copy strictly newer than cache; bypass blob-exists short-circuits at commit
+        std::vector<uint8_t> expectedSha; // scan-time SHA-1; abort commit on mismatch (torn-read defense)
     };
     std::vector<PendingImport> pendingImports;
     bool tokenMetadataChanged = false;
@@ -339,46 +341,65 @@ static void BootstrapAutoCloudFilesWorker(uint32_t accountId, uint32_t appId,
         if (IsInternalMetadataFile(fe.filename)) continue;
 
         auto it = existing.find(fe.filename);
+        bool isRefresh = false;
         if (it != existing.end()) {
-            if (!(it->second.sha == fe.sha && it->second.rawSize == fe.rawSize)) {
-                LOG("[AutoCloudImport] Skipping existing app %u file %s to avoid overwriting cached/cloud data",
+            const bool contentMatches =
+                (it->second.sha == fe.sha && it->second.rawSize == fe.rawSize);
+            if (!contentMatches) {
+                // Refresh only when disk mtime > cached mtime; otherwise the local copy is a pre-CloudRedirect leftover.
+                if (fe.timestamp > it->second.timestamp) {
+                    LOG("[AutoCloudImport] Refreshing app %u file %s: disk mtime %llu > cached %llu (size %llu->%llu)",
+                        appId, fe.filename.c_str(),
+                        (unsigned long long)fe.timestamp,
+                        (unsigned long long)it->second.timestamp,
+                        (unsigned long long)it->second.rawSize,
+                        (unsigned long long)fe.rawSize);
+                    isRefresh = true;
+                } else {
+                    LOG("[AutoCloudImport] Skipping existing app %u file %s: disk mtime %llu <= cached %llu",
+                        appId, fe.filename.c_str(),
+                        (unsigned long long)fe.timestamp,
+                        (unsigned long long)it->second.timestamp);
+                    continue;
+                }
+            } else {
+                // Identical content: reconcile root-token metadata only.
+                auto existingToken = fileTokens.find(fe.filename);
+                if (existingToken == fileTokens.end() || existingToken->second != fe.rootToken) {
+                    fileTokens[fe.filename] = fe.rootToken;
+                    tokenMetadataChanged = true;
+                    LOG("[AutoCloudImport] Canonical root token for app %u file %s: '%s'",
+                        appId, fe.filename.c_str(), fe.rootToken.c_str());
+                }
+                if (!fe.rootToken.empty() && !rootTokens.count(fe.rootToken)) {
+                    rootTokens.insert(fe.rootToken);
+                    tokenMetadataChanged = true;
+                }
+                continue;
+            }
+        }
+        if (!isRefresh) {
+            auto blobStatus = CloudStorage::CheckBlobExists(accountId, appId, fe.filename);
+            if (blobStatus == ICloudProvider::ExistsStatus::Error) {
+                LOG("[AutoCloudImport] Aborting import for app %u: could not verify cloud blob %s",
+                    appId, fe.filename.c_str());
+                ClearAutoCloudCanonicalTokens(accountId, appId, cacheGeneration);
+                finish(false, cacheGeneration);
+                return;
+            }
+            if (blobStatus == ICloudProvider::ExistsStatus::Exists) {
+                LOG("[AutoCloudImport] Skipping app %u file %s because blob already exists in cache/cloud",
                     appId, fe.filename.c_str());
                 continue;
             }
-
-            auto existingToken = fileTokens.find(fe.filename);
-            if (existingToken == fileTokens.end() || existingToken->second != fe.rootToken) {
-                fileTokens[fe.filename] = fe.rootToken;
-                tokenMetadataChanged = true;
-                LOG("[AutoCloudImport] Canonical root token for app %u file %s: '%s'",
-                    appId, fe.filename.c_str(), fe.rootToken.c_str());
+            if (tombstoneSnapshot.count(fe.filename) > 0) {
+                LOG("[AutoCloudImport] Skipping app %u file %s because it has a delete tombstone",
+                    appId, fe.filename.c_str());
+                continue;
             }
-            if (!fe.rootToken.empty() && !rootTokens.count(fe.rootToken)) {
-                rootTokens.insert(fe.rootToken);
-                tokenMetadataChanged = true;
-            }
-            continue;
-        }
-        auto blobStatus = CloudStorage::CheckBlobExists(accountId, appId, fe.filename);
-        if (blobStatus == ICloudProvider::ExistsStatus::Error) {
-            LOG("[AutoCloudImport] Aborting import for app %u: could not verify cloud blob %s",
-                appId, fe.filename.c_str());
-            ClearAutoCloudCanonicalTokens(accountId, appId, cacheGeneration);
-            finish(false, cacheGeneration);
-            return;
-        }
-        if (blobStatus == ICloudProvider::ExistsStatus::Exists) {
-            LOG("[AutoCloudImport] Skipping app %u file %s because blob already exists in cache/cloud",
-                appId, fe.filename.c_str());
-            continue;
-        }
-        if (tombstoneSnapshot.count(fe.filename) > 0) {
-            LOG("[AutoCloudImport] Skipping app %u file %s because it has a delete tombstone",
-                appId, fe.filename.c_str());
-            continue;
         }
 
-        pendingImports.push_back({ fe.filename, fe.sourcePath, fe.timestamp, fe.rootToken });
+        pendingImports.push_back({ fe.filename, fe.sourcePath, fe.timestamp, fe.rootToken, isRefresh, fe.sha });
     }
 
     if (pendingImports.empty() && !tokenMetadataChanged) {
@@ -409,7 +430,8 @@ static void BootstrapAutoCloudFilesWorker(uint32_t accountId, uint32_t appId,
                     appId, pending.filename.c_str());
                 continue;
             }
-            if (CloudStorage::HasLocalBlob(accountId, appId, pending.filename)) {
+            // Refreshes intentionally overwrite an existing local/cloud blob.
+            if (!pending.refresh && CloudStorage::HasLocalBlob(accountId, appId, pending.filename)) {
                 LOG("[AutoCloudImport] Skipping app %u file %s because blob appeared before commit",
                     appId, pending.filename.c_str());
                 continue;
@@ -422,6 +444,13 @@ static void BootstrapAutoCloudFilesWorker(uint32_t accountId, uint32_t appId,
                 continue;
             }
             const uint8_t* ptr = data.empty() ? nullptr : data.data();
+            // Torn-read defense: SHA mismatch means the game rewrote the file mid-scan.
+            if (!pending.expectedSha.empty() &&
+                LocalStorage::SHA1(ptr, data.size()) != pending.expectedSha) {
+                LOG("[AutoCloudImport] Skipping app %u file %s: source content changed between scan and commit",
+                    appId, pending.filename.c_str());
+                continue;
+            }
             if (!CloudStorage::StoreBlob(accountId, appId, pending.filename, ptr, data.size())) {
                 LOG("[AutoCloudImport] Failed to cache app %u file %s", appId, pending.filename.c_str());
                 continue;
@@ -439,7 +468,9 @@ static void BootstrapAutoCloudFilesWorker(uint32_t accountId, uint32_t appId,
             }
             LocalStorage::SetFileTimestamp(accountId, appId, pending.filename, pending.timestamp);
             ++imported;
-            LOG("[AutoCloudImport] Imported app %u file %s", appId, pending.filename.c_str());
+            LOG("[AutoCloudImport] %s app %u file %s",
+                pending.refresh ? "Refreshed" : "Imported",
+                appId, pending.filename.c_str());
         }
         if (imported == 0 && !tokenMetadataChanged) {
             finish(true, publishGeneration);
