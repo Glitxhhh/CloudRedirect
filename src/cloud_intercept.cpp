@@ -3038,6 +3038,74 @@ static void PreStageStatsFromLocalCache(const std::string& steamPath) {
         LOG("[PreStage] Staged %d UserGameStats files from local cache (skipped %d non-empty)", staged, skipped);
 }
 
+// Read the most recently logged-in accountId from loginusers.vdf.
+// Returns 0 if the file is missing, unreadable, or has no MostRecent entry.
+// This lets us resolve the accountId at Init time, before any Steam packets
+// arrive, so we can seed local stats storage from cloud on first boot.
+static uint32_t ReadMostRecentAccountId(const std::string& steamPath) {
+    std::string vdfPath = steamPath + "config\\loginusers.vdf";
+    auto vdfWide = FileUtil::Utf8ToPath(vdfPath).wstring();
+
+    HANDLE hFile = CreateFileW(vdfWide.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        LOG("[ReadMostRecentAccountId] Cannot open loginusers.vdf (err=%lu)", GetLastError());
+        return 0;
+    }
+
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    std::string vdfContent;
+    if (fileSize > 0 && fileSize != INVALID_FILE_SIZE) {
+        vdfContent.resize(fileSize);
+        DWORD bytesRead = 0;
+        ReadFile(hFile, vdfContent.data(), fileSize, &bytesRead, nullptr);
+        vdfContent.resize(bytesRead);
+    }
+    CloseHandle(hFile);
+
+    if (vdfContent.empty()) return 0;
+
+    // loginusers.vdf structure:
+    //   "users" { "{steamid64}" { ... "MostRecent" "1" ... } }
+    // Enumerate direct children of the "users" section; for each candidate
+    // steamid64 check whether MostRecent == "1".
+    uint32_t foundAccountId = 0;
+
+    const char* usersPath[] = { "users" };
+    VdfUtil::ForEachChildInSection(vdfContent, usersPath, 1,
+        [&](std::string_view steamId64Str) -> bool {
+            if (foundAccountId != 0) return false; // already found, stop
+
+            std::string sidStr(steamId64Str);
+            uint64_t steamId64 = strtoull(sidStr.c_str(), nullptr, 10);
+            if (steamId64 == 0) return true;
+
+            bool isMostRecent = false;
+            const char* userPath[] = { "users", sidStr.c_str() };
+            VdfUtil::ForEachFieldInSection(vdfContent, userPath, 2,
+                [&](const VdfUtil::FieldInfo& fi) -> bool {
+                    if (fi.key == "MostRecent" && fi.value == "1") {
+                        isMostRecent = true;
+                        return false; // stop inner iteration
+                    }
+                    return true;
+                });
+
+            if (isMostRecent)
+                foundAccountId = static_cast<uint32_t>(steamId64 & 0xFFFFFFFF);
+
+            return true;
+        });
+
+    if (foundAccountId)
+        LOG("[ReadMostRecentAccountId] Resolved accountId=%u from loginusers.vdf", foundAccountId);
+    else
+        LOG("[ReadMostRecentAccountId] No MostRecent entry found in loginusers.vdf");
+
+    return foundAccountId;
+}
+
 void Init(const std::string& steamPath) {
     g_steamPath = steamPath;
     if (!g_steamPath.empty() && g_steamPath.back() != '\\')
@@ -3086,7 +3154,9 @@ void Init(const std::string& steamPath) {
         LOG("Steam version: %llu (OK)", detectedVersion);
     }
 
-    PreStageStatsFromLocalCache(g_steamPath);
+    // Resolve accountId early from loginusers.vdf so we can seed stats on first boot.
+    // g_steamId is not yet captured from packets at this point.
+    uint32_t earlyAccountId = ReadMostRecentAccountId(g_steamPath);
 
     // Auto-detect namespace apps from {steamPath}\config\stplug-in\*.lua, restricted to self-unlocking luas (base-game addappid for own id).
     std::string pluginDir = g_steamPath + "config\\stplug-in\\*";
@@ -3466,6 +3536,19 @@ void Init(const std::string& steamPath) {
 
     CloudStorage::Init(cloudRoot, std::move(provider));
     g_startupMetadataScheduled.store(false);
+
+    // First-boot fix: seed local stats cache from cloud before pre-staging.
+    // On a fresh PC the local cache is empty so PreStageStatsFromLocalCache
+    // would be a no-op.  SeedAccountStatsFromCloud does a synchronous pull of
+    // all UserGameStats blobs into local storage so the pre-stage below finds
+    // them and writes them into appcache/stats/ before Steam reads that
+    // directory on startup.  earlyAccountId comes from loginusers.vdf above,
+    // so it is available even before the first packet arrives.
+    // Gated on g_syncAchievements so users who have opted out are unaffected.
+    if (g_syncAchievements && earlyAccountId) {
+        CloudStorage::SeedAccountStatsFromCloud(earlyAccountId);
+    }
+    PreStageStatsFromLocalCache(g_steamPath);
 
     // Launch deferred lua sync thread (waits for accountId to be captured).
     if (g_syncLuas) {
