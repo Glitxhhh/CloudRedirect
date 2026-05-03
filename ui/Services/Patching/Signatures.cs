@@ -284,9 +284,10 @@ namespace CloudRedirect.Services.Patching
                 Pattern = new byte[] { 0xC7, 0x40, 0x09, 0xE0, 0x01, 0x00, 0x00 },
                 Mask    = new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
                 PatchOffset = 0,
-                Original    = new byte[] { 0x89, 0x3D, 0x28, 0xD5, 0xFE, 0xFF },
+                Original    = new byte[] { 0x89, 0x3D, 0x00, 0x00, 0x00, 0x00 },
                 Replacement = new byte[] { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 },
                 Region = ScanRegion.Obfuscated,
+                WildcardStart = 2, WildcardLen = 4,
                 PatchSiteResolver = (data, hit) =>
                 {
                     int searchStart = hit + 7;
@@ -309,41 +310,46 @@ namespace CloudRedirect.Services.Patching
 
         public static readonly PatternPatch[] PayloadSetupDefs =
         {
-            // P4: force activation flag to 1. 21 fixed bytes across 46-byte span;
-            // null-check-before-strcmp + E9 obfuscator bridge is the distinctive cue.
+            // P4: force activation flag to 1. The obfuscator inserts E9 00000000 (jmp $+5)
+            // bridges between instructions. Pattern: test r8,r8 / [bridge] / jz / call / test eax,eax /
+            // [bridge] / jnz / mov [flag],1 / [bridge] / jmp merge / mov [flag],0 (PATCH SITE)
             new PatternPatch
             {
                 Name = "P4 (activation flag)",
                 Pattern = new byte[] {
                     0x4D, 0x85, 0xC0,                                     // test r8, r8
+                    0xE9, 0x00, 0x00, 0x00, 0x00,                         // jmp bridge
                     0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,                   // jz near
                     0xE8, 0x00, 0x00, 0x00, 0x00,                         // call strcmp_wrapper
                     0x85, 0xC0,                                           // test eax, eax
-                    0x0F, 0x85, 0x00, 0x00, 0x00, 0x00,                   // jnz near (to patch site)
-                    0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01,             // mov [g_bActivationFlag], 1
-                    0xE9, 0x00, 0x00, 0x00, 0x00,                         // jmp $+5 (obfuscator bridge)
+                    0xE9, 0x00, 0x00, 0x00, 0x00,                         // jmp bridge
+                    0x0F, 0x85, 0x00, 0x00, 0x00, 0x00,                   // jnz near
+                    0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01,             // mov [flag], 1
+                    0xE9, 0x00, 0x00, 0x00, 0x00,                         // jmp bridge
                     0xE9, 0x00, 0x00, 0x00, 0x00,                         // jmp merge
-                    0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00              // PATCH SITE: mov [flag], 0
+                    0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00              // PATCH: mov [flag], 0
                 },
                 Mask = new byte[] {
                     0xFF, 0xFF, 0xFF,                                     // test r8, r8
+                    0xFF, 0x00, 0x00, 0x00, 0x00,                         // jmp bridge
                     0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,                   // jz near
                     0xFF, 0x00, 0x00, 0x00, 0x00,                         // call
                     0xFF, 0xFF,                                           // test eax, eax
+                    0xFF, 0x00, 0x00, 0x00, 0x00,                         // jmp bridge
                     0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,                   // jnz near
                     0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF,             // mov [flag], 1
-                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF,                         // E9 00 00 00 00
+                    0xFF, 0x00, 0x00, 0x00, 0x00,                         // jmp bridge
                     0xFF, 0x00, 0x00, 0x00, 0x00,                         // jmp merge
                     0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00              // PATCH SITE
                 },
-                PatchOffset = 39,
-                Original    = new byte[] { 0xC6, 0x05, 0xC6, 0x20, 0xFE, 0xFF, 0x00 },
-                Replacement = new byte[] { 0xC6, 0x05, 0xC6, 0x20, 0xFE, 0xFF, 0x01 },
+                PatchOffset = 49,
+                Original    = new byte[] { 0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00 },
+                Replacement = new byte[] { 0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01 },
                 Region = ScanRegion.Obfuscated,
                 WildcardStart = 2, WildcardLen = 4,
                 Validator = (data, hit) =>
                 {
-                    byte val = data[hit + 45];
+                    byte val = data[hit + 55];
                     return val == 0x00 || val == 0x01;
                 },
             },
