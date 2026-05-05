@@ -74,6 +74,7 @@ public sealed class OAuthService : IDisposable
 
     // OneDrive (using rclone's public client ID - our Azure AD app has redirect URI issues)
     private const string OneDriveClientId = "b15665d9-eda6-4092-8539-0eec376afd59";
+    private const string OneDriveClientSecret = "qtyfaBBYA403=unZUP40~_#";
     private const string OneDriveScope = "Files.ReadWrite offline_access";
     private const string OneDriveAuthUrl =
         "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
@@ -429,11 +430,12 @@ public sealed class OAuthService : IDisposable
     private async Task<TokenResult?> ExchangeOneDriveCodeAsync(
         string code, string redirectUri, CancellationToken cancel)
     {
-        // OneDrive with rclone's client ID: no PKCE code_verifier
+        // OneDrive with rclone's client ID: requires client_secret, no PKCE
         var body = new FormUrlEncodedContent(new Dictionary<string, string>
         {
             ["code"] = code,
             ["client_id"] = OneDriveClientId,
+            ["client_secret"] = OneDriveClientSecret,
             ["redirect_uri"] = redirectUri,
             ["grant_type"] = "authorization_code",
             ["scope"] = OneDriveScope

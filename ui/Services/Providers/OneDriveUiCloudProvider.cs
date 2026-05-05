@@ -12,9 +12,10 @@ namespace CloudRedirect.Services.Providers;
 /// </summary>
 internal sealed class OneDriveUiCloudProvider : IUiCloudProvider
 {
-    // Same credentials as OAuthService / DLL (public client).
-    private const string OneDriveClientId = "c582f799-5dc5-48a7-a4cd-cd0d8af354a2";
-    private const string OneDriveTokenUrl = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+    // Same credentials as OAuthService (rclone's public client).
+    private const string OneDriveClientId = "b15665d9-eda6-4092-8539-0eec376afd59";
+    private const string OneDriveClientSecret = "qtyfaBBYA403=unZUP40~_#";
+    private const string OneDriveTokenUrl = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
 
     private readonly HttpClient _http;
     private readonly Action<string>? _log;
@@ -204,6 +205,7 @@ internal sealed class OneDriveUiCloudProvider : IUiCloudProvider
         var body = new FormUrlEncodedContent(new Dictionary<string, string>
         {
             ["client_id"] = OneDriveClientId,
+            ["client_secret"] = OneDriveClientSecret,
             ["refresh_token"] = refreshToken,
             ["grant_type"] = "refresh_token",
             ["scope"] = "Files.ReadWrite offline_access"

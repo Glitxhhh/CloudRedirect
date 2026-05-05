@@ -17,9 +17,11 @@ using HttpUtil::HttpResp;
 
 // rclone's public Azure AD client ID (our own app has redirect URI issues)
 static constexpr const char* CLIENT_ID = "b15665d9-eda6-4092-8539-0eec376afd59";
+static constexpr const char* CLIENT_SECRET = "qtyfaBBYA403=unZUP40~_#";
 
 std::string OneDriveProvider::BuildRefreshBody(const std::string& refreshToken) const {
     return "client_id=" + UrlEncode(CLIENT_ID) +
+        "&client_secret=" + UrlEncode(CLIENT_SECRET) +
         "&refresh_token=" + UrlEncode(refreshToken) +
         "&grant_type=refresh_token" +
         "&scope=" + UrlEncode("Files.ReadWrite offline_access");
