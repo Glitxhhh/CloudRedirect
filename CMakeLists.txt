@@ -139,6 +139,18 @@ if(WIN32)
     target_link_libraries(cloud_redirect_cli PRIVATE Shell32 Ole32)
     # Ensure DLL is built before CLI
     add_dependencies(cloud_redirect_cli cloud_redirect)
+
+    # CloudRedirect loader stub for OpenSteamTool. Installed in Steam folder
+    # as cr_loader.dll. OST's hijack DLLs are string-patched to load this
+    # filename instead of OpenSteamTool.dll, so the real OST stays at its
+    # natural filename and the stub loads OST + CR side by side.
+    add_library(cr_loader SHARED
+        src/platform/win/ost_chainloader.cpp
+    )
+    set_target_properties(cr_loader PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "cr_loader"
+    )
 else()
     target_include_directories(cloud_redirect PRIVATE src/platform/linux)
     target_link_libraries(cloud_redirect PRIVATE dl pthread)

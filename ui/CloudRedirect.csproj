@@ -39,6 +39,8 @@
       <NativeDllDest>$(MSBuildProjectDirectory)\Resources\cloud_redirect.dll</NativeDllDest>
       <NativeCliSource>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\build\Release\cloud_redirect_cli.exe'))</NativeCliSource>
       <NativeCliDest>$(MSBuildProjectDirectory)\Resources\cloud_redirect_cli.exe</NativeCliDest>
+      <OstChainSource>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\build\Release\cr_loader.dll'))</OstChainSource>
+      <OstChainDest>$(MSBuildProjectDirectory)\Resources\cr_loader.dll</OstChainDest>
     </PropertyGroup>
     <MakeDir Directories="$(MSBuildProjectDirectory)\Resources" Condition="!Exists('$(MSBuildProjectDirectory)\Resources')" />
     <Copy SourceFiles="$(NativeDllSource)" DestinationFiles="$(NativeDllDest)"
@@ -47,16 +49,24 @@
     <Copy SourceFiles="$(NativeCliSource)" DestinationFiles="$(NativeCliDest)"
           Condition="Exists('$(NativeCliSource)')"
           SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(OstChainSource)" DestinationFiles="$(OstChainDest)"
+          Condition="Exists('$(OstChainSource)')"
+          SkipUnchangedFiles="true" />
     <ItemGroup Condition="Exists('$(NativeDllDest)')">
       <EmbeddedResource Include="$(NativeDllDest)" LogicalName="cloud_redirect.dll" />
     </ItemGroup>
     <ItemGroup Condition="Exists('$(NativeCliDest)')">
       <EmbeddedResource Include="$(NativeCliDest)" LogicalName="cloud_redirect_cli.exe" />
     </ItemGroup>
+    <ItemGroup Condition="Exists('$(OstChainDest)')">
+      <EmbeddedResource Include="$(OstChainDest)" LogicalName="cr_loader.dll" />
+    </ItemGroup>
     <Warning Text="cloud_redirect.dll not found at $(NativeDllSource) — embedded resource will be stale or missing"
              Condition="!Exists('$(NativeDllSource)')" />
     <Warning Text="cloud_redirect_cli.exe not found at $(NativeCliSource) — embedded CLI will be stale or missing"
              Condition="!Exists('$(NativeCliSource)')" />
+    <Warning Text="cr_loader.dll not found at $(OstChainSource) — OST install path will not work"
+             Condition="!Exists('$(OstChainSource)')" />
   </Target>
 
   <ItemGroup>
