@@ -188,6 +188,8 @@ static std::mutex g_batchCanonicalTokensMutex;
 // Serializes token load-merge-save cycles.
 static std::mutex g_tokenCaptureMutex;
 
+static std::unordered_map<uint64_t, uint64_t> g_lastVerifiedCN;
+static std::mutex g_lastVerifiedCNMutex;
 
 // Strip Steam root token prefix plus any \r\n between token and path.
 // Sanitize control chars in RPC-sourced strings before logging to prevent log injection.
@@ -1058,8 +1060,53 @@ PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& req
                 LOG("[NS-CL] Migration sync complete for app %u", appId);
             }
         } else if (cloudCN == localCN) {
-            LOG("[NS-CL] Local CN matches cloud CN=%llu for app %u, using local inventory",
-                localCN, appId);
+            bool needsVerify = true;
+            {
+                std::lock_guard<std::mutex> lock(g_lastVerifiedCNMutex);
+                auto it = g_lastVerifiedCN.find(appKey);
+                if (it != g_lastVerifiedCN.end() && it->second == localCN)
+                    needsVerify = false;
+            }
+            if (needsVerify) {
+                LOG("[NS-CL] Local CN matches cloud CN=%llu for app %u, checking for conflicts",
+                    localCN, appId);
+                cloudManifest = CloudStorage::FetchCloudManifest(accountId, appId);
+                if (!cloudManifest.empty()) {
+                    auto localFiles = LocalStorage::GetFileList(accountId, appId);
+                    bool hasMismatch = false;
+                    for (const auto& [filename, entry] : cloudManifest) {
+                        if (IsReservedBlobFilename(filename)) continue;
+                        bool foundLocally = false;
+                        for (const auto& lf : localFiles) {
+                            if (lf.filename == filename) {
+                                foundLocally = true;
+                                if (lf.sha != entry.sha) hasMismatch = true;
+                                break;
+                            }
+                        }
+                        if (!foundLocally) hasMismatch = true;
+                        if (hasMismatch) break;
+                    }
+                    if (hasMismatch) {
+                        LOG("[NS-CL] SHA mismatch at same CN=%llu for app %u — using cloud manifest to trigger conflict",
+                            localCN, appId);
+                        haveCloudManifest = true;
+                    } else {
+                        LOG("[NS-CL] No SHA mismatch at CN=%llu for app %u, using local inventory",
+                            localCN, appId);
+                        std::lock_guard<std::mutex> lock(g_lastVerifiedCNMutex);
+                        g_lastVerifiedCN[appKey] = localCN;
+                    }
+                } else {
+                    LOG("[NS-CL] Local CN matches cloud CN=%llu for app %u, no cloud manifest",
+                        localCN, appId);
+                    std::lock_guard<std::mutex> lock(g_lastVerifiedCNMutex);
+                    g_lastVerifiedCN[appKey] = localCN;
+                }
+            } else {
+                LOG("[NS-CL] Local CN matches cloud CN=%llu for app %u, already verified",
+                    localCN, appId);
+            }
         } else {
             LOG("[NS-CL] Local CN=%llu > cloud CN=%llu for app %u, using local data (unsynced changes)",
                 localCN, cloudCN, appId);
@@ -2164,6 +2211,10 @@ PB::Writer HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& req
     UpdateRemotecacheVdfChangeNumber(accountId, appId, newCN);
 
     ClearBatchCanonicalTokens(accountId, appId);
+    {
+        std::lock_guard<std::mutex> lock(g_lastVerifiedCNMutex);
+        g_lastVerifiedCN.erase(MakeAppAccountKey(accountId, appId));
+    }
     PB::Writer body; // empty response
     return body;
 }
