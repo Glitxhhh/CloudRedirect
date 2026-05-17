@@ -13,7 +13,7 @@ namespace CloudRedirect.Pages;
 
 public partial class SettingsPage : Page
 {
-    private const string ReleasesUrl = "https://github.com/Selectively11/CloudRedirect/releases";
+    private const string ReleasesUrl = "https://github.com/JanitorialMess/CloudRedirect/releases";
 
     private string? _latestDownloadUrl;
     private bool _languageLoading;
