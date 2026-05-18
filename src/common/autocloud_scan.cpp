@@ -672,6 +672,11 @@ ScanResult GetFileList(const std::string& steamPath,
         std::string xdg = getEnvStr("XDG_CONFIG_HOME");
         linuxXdgConfigHome = xdg.empty() ? (home + "/.config/") : (xdg + "/");
     }
+    if (effectivePlatform == AutoCloudEffectivePlatform::Windows) {
+        linuxHome.clear();
+        linuxXdgDataHome.clear();
+        linuxXdgConfigHome.clear();
+    }
 #endif
     RootMapping mappings[] = {
         {"",                   "",                      0,                 FileUtil::PathToUtf8(appUserdataDir / "remote")},
@@ -1123,6 +1128,11 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
     {
         std::string xdg = getEnvStr("XDG_CONFIG_HOME");
         linuxXdgConfigHome = xdg.empty() ? (home + "/.config/") : (xdg + "/");
+    }
+    if (effectivePlatform == AutoCloudEffectivePlatform::Windows) {
+        linuxHome.clear();
+        linuxXdgDataHome.clear();
+        linuxXdgConfigHome.clear();
     }
 #endif
 
