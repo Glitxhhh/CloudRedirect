@@ -123,8 +123,21 @@ class Program
             Console.WriteLine("Steam closed.");
         }
 
-        // ApplyOfflineSetup will deploy embedded payload if cache is missing
         var patcher = new Patcher(steamPath, msg => Console.WriteLine(msg));
+
+        // Download core DLLs if missing
+        if (!patcher.HasCoreDll())
+        {
+            Console.WriteLine();
+            Console.WriteLine("Downloading SteamTools core DLLs...");
+            var repairResult = patcher.RepairCoreDlls();
+            if (repairResult?.Succeeded != true)
+            {
+                Console.Error.WriteLine($"FAILED: {repairResult?.Error ?? "Could not download core DLLs"}");
+                return 1;
+            }
+            Console.WriteLine("OK");
+        }
 
         // Apply STFixer patches
         Console.WriteLine();
