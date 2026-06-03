@@ -3646,49 +3646,14 @@ void Init(const std::string& steamPath) {
     if (!g_steamPath.empty() && g_steamPath.back() != '\\')
         g_steamPath += '\\';
 
-    // Steam version gate
+    // Read Steam version early (used by version gate below and auto-update).
     uint64_t detectedVersion = ReadSteamVersion(g_steamPath);
     g_detectedSteamVersion.store(detectedVersion, std::memory_order_relaxed);
-    if (detectedVersion == 0) {
-        LOG("FATAL: Could not read Steam version from manifest");
-
-        MessageBoxA(nullptr,
-            "CloudRedirect could not determine the installed Steam version.\n\n"
-            "The manifest file may be missing or unreadable.\n\n"
-            "CloudRedirect will NOT activate.",
-            "CloudRedirect -- Version Unknown",
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
-        return;
-    } else if (!IsSupportedSteamVersion(detectedVersion)) {
-        constexpr uint64_t newestSupported = SUPPORTED_STEAM_VERSIONS[0];
-        bool steamIsNewer = detectedVersion > newestSupported;
-        LOG("FATAL: Steam version mismatch! supported_newest=%llu actual=%llu (%s)",
-            newestSupported, detectedVersion,
-            steamIsNewer ? "Steam is newer" : "Steam is older");
-
-        char msg[512];
-        if (steamIsNewer) {
-            snprintf(msg, sizeof(msg),
-                "Your Steam client (version %llu) is newer than what "
-                "CloudRedirect supports (version %llu).\n\n"
-                "Update CloudRedirect to match your Steam version.\n\n"
-                "CloudRedirect will NOT activate.",
-                detectedVersion, newestSupported);
-        } else {
-            snprintf(msg, sizeof(msg),
-                "Your Steam client (version %llu) is older than what "
-                "CloudRedirect expects (version %llu).\n\n"
-                "Update Steam to match your CloudRedirect version.\n\n"
-                "CloudRedirect will NOT activate.",
-                detectedVersion, newestSupported);
-        }
-
-        MessageBoxA(nullptr, msg, "CloudRedirect -- Version Mismatch",
-                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
-        return;  // abort initialization - no hooks installed
-    } else {
-        LOG("Steam version: %llu (OK)", detectedVersion);
-    }
+    bool versionOk = (detectedVersion != 0) && IsSupportedSteamVersion(detectedVersion);
+    if (detectedVersion != 0)
+        LOG("Steam version: %llu (%s)", detectedVersion, versionOk ? "OK" : "UNSUPPORTED");
+    else
+        LOG("Steam version: UNKNOWN (manifest unreadable)");
 
     PreStageStatsFromLocalCache(g_steamPath);
 
@@ -3841,6 +3806,61 @@ void Init(const std::string& steamPath) {
     }
 
     LOG("cloud_redirect=%d", g_cloudRedirectEnabled.load());
+
+    // Steam version gate (after config read so we know the mode).
+    if (!versionOk) {
+        bool isCloudMode = g_cloudRedirectEnabled.load();
+        if (isCloudMode) {
+            // CloudRedirect mode: block cloud init, but STFixer still works.
+            if (detectedVersion == 0) {
+                LOG("FATAL: Could not read Steam version from manifest");
+                MessageBoxA(nullptr,
+                    "CloudRedirect could not determine the installed Steam version.\n\n"
+                    "CloudRedirect cannot activate. STFixer patches will still apply.",
+                    "CloudRedirect -- Version Unknown",
+                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+            } else {
+                constexpr uint64_t newestSupported = SUPPORTED_STEAM_VERSIONS[0];
+                bool steamIsNewer = detectedVersion > newestSupported;
+                LOG("FATAL: Steam version mismatch! supported_newest=%llu actual=%llu (%s)",
+                    newestSupported, detectedVersion,
+                    steamIsNewer ? "Steam is newer" : "Steam is older");
+                char msg[512];
+                if (steamIsNewer) {
+                    snprintf(msg, sizeof(msg),
+                        "Your Steam client (version %llu) is newer than what "
+                        "CloudRedirect supports (version %llu).\n\n"
+                        "Update CloudRedirect to match your Steam version.\n\n"
+                        "CloudRedirect cannot activate. STFixer patches will still apply.",
+                        detectedVersion, newestSupported);
+                } else {
+                    snprintf(msg, sizeof(msg),
+                        "Your Steam client (version %llu) is older than what "
+                        "CloudRedirect expects (version %llu).\n\n"
+                        "Update Steam to match your CloudRedirect version.\n\n"
+                        "CloudRedirect cannot activate. STFixer patches will still apply.",
+                        detectedVersion, newestSupported);
+                }
+                MessageBoxA(nullptr, msg, "CloudRedirect -- Version Mismatch",
+                            MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+            }
+            return;  // block cloud init, STFixer patches already applied by payload
+        } else {
+            // STFixer mode: warn once, continue.
+            std::string flagPath = cloudRoot + ".version_warned_" + std::to_string(detectedVersion);
+            if (!std::filesystem::exists(FileUtil::Utf8ToPath(flagPath))) {
+                MessageBoxA(nullptr,
+                    "CloudRedirect is not fully compatible with your Steam client version.\n\n"
+                    "STFixer patches should still work, but consider updating CloudRedirect.\n\n"
+                    "This message will only be shown once.",
+                    "CloudRedirect -- Update Available",
+                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+                // Write flag so we don't show again
+                std::ofstream(FileUtil::Utf8ToPath(flagPath)) << "1";
+            }
+            LOG("Steam version unsupported but STFixer mode -- continuing with warning");
+        }
+    }
 
     if (!g_cloudRedirectEnabled.load()) {
         LOG("Cloud redirection disabled, skipping cloud init");
@@ -4167,7 +4187,6 @@ void InstallManifestPinHook() {
         0x4C, 0x89, 0x48, 0x20,        // mov [rax+20h], r9
         0x89, 0x50, 0x10,              // mov [rax+10h], edx
         0x48, 0x89, 0x48, 0x08         // mov [rax+8], rcx
-        0x48, 0x83, 0xB9, 0xF0, 0x00  // cmp qword ptr [rcx+F0h], ...
     };
     if (memcmp(g_bddOrigAddr, expectedPrologue, SC_BDD_STOLEN_BYTES) != 0) {
         LOG("[ManifestPin] Prologue mismatch! Steam may have updated. Aborting hook.");
