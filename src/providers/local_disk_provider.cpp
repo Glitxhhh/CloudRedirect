@@ -15,7 +15,7 @@ bool LocalDiskProvider::Init(const std::string& rootPath) {
         m_root += '/';
 #endif
     std::error_code ec;
-    std::filesystem::create_directories(FileUtil::Utf8ToPath(m_root), ec);
+    std::filesystem::create_directories(FileUtil::LongPath(FileUtil::Utf8ToPath(m_root)), ec);
     if (ec) {
         LOG("[LocalDiskProvider] Failed to create root %s: %s", m_root.c_str(), ec.message().c_str());
         return false;
@@ -53,14 +53,14 @@ bool LocalDiskProvider::Upload(const std::string& path,
                                const uint8_t* data, size_t len) {
     std::string full = ToFullPath(path);
     if (full.empty()) return false;
-    auto fullPath = FileUtil::Utf8ToPath(full);
+    auto fullPath = FileUtil::LongPath(FileUtil::Utf8ToPath(full));
     auto parent = fullPath.parent_path();
     // CAS migration: if a legacy flat blob file blocks a directory needed for
     // the new filename/sha layout, remove it before creating directories.
     // Walk each component of parent; if any is a regular file, remove it.
     {
         std::error_code rootEc;
-        auto root = std::filesystem::canonical(FileUtil::Utf8ToPath(m_root), rootEc);
+        auto root = std::filesystem::canonical(FileUtil::LongPath(FileUtil::Utf8ToPath(m_root)), rootEc);
         if (!rootEc) {
             auto cur = parent;
             for (int depth = 0; depth < 12 && cur.has_parent_path(); ++depth) {
@@ -115,7 +115,7 @@ bool LocalDiskProvider::Download(const std::string& path,
                                  std::vector<uint8_t>& outData) {
     std::string full = ToFullPath(path);
     if (full.empty()) return false;
-    std::ifstream f(FileUtil::Utf8ToPath(full), std::ios::binary);
+    std::ifstream f(FileUtil::LongPath(FileUtil::Utf8ToPath(full)), std::ios::binary);
     if (!f) return false;
     outData.assign(std::istreambuf_iterator<char>(f),
                    std::istreambuf_iterator<char>());
@@ -126,7 +126,7 @@ bool LocalDiskProvider::Remove(const std::string& path) {
     std::string full = ToFullPath(path);
     if (full.empty()) return false;
     std::error_code ec;
-    std::filesystem::remove(FileUtil::Utf8ToPath(full), ec);
+    std::filesystem::remove(FileUtil::LongPath(FileUtil::Utf8ToPath(full)), ec);
     // success if removed or never existed
     return !ec;
 }
@@ -135,7 +135,7 @@ ICloudProvider::ExistsStatus LocalDiskProvider::CheckExists(const std::string& p
     std::string full = ToFullPath(path);
     if (full.empty()) return ExistsStatus::Error;
     std::error_code ec;
-    auto fsPath = FileUtil::Utf8ToPath(full);
+    auto fsPath = FileUtil::LongPath(FileUtil::Utf8ToPath(full));
     bool exists = std::filesystem::exists(fsPath, ec);
     if (ec) return ExistsStatus::Error;
     if (!exists) return ExistsStatus::Missing;
@@ -157,7 +157,7 @@ bool LocalDiskProvider::ListChecked(const std::string& prefix, std::vector<FileI
     std::string dir = ToFullPath(prefix);
     if (dir.empty()) return false;
     std::error_code ec;
-    auto dirPath = FileUtil::Utf8ToPath(dir);
+    auto dirPath = FileUtil::LongPath(FileUtil::Utf8ToPath(dir));
     bool exists = std::filesystem::exists(dirPath, ec);
     if (ec) return false;
     if (!exists) { if (outComplete) *outComplete = true; return true; }
@@ -184,7 +184,7 @@ bool LocalDiskProvider::ListChecked(const std::string& prefix, std::vector<FileI
         if (!isFile) continue;
 
         std::string rel = FileUtil::PathToUtf8(
-            std::filesystem::relative(entry.path(), FileUtil::Utf8ToPath(m_root), ec2));
+            std::filesystem::relative(entry.path(), FileUtil::LongPath(FileUtil::Utf8ToPath(m_root)), ec2));
         if (ec2) { sawSkippedEntries = true; continue; }
         // Forward slashes per ICloudProvider convention.
         for (auto& c : rel) {

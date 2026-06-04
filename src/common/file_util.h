@@ -33,6 +33,21 @@ inline bool AtomicWriteText(const std::string& path, const std::string& content)
     return Platform().AtomicWriteText(path, content);
 }
 
+// Long path support (\\?\ prefix on Windows, no-op on Linux)
+inline std::filesystem::path LongPath(const std::filesystem::path& p) {
+#ifdef _WIN32
+    const auto& s = p.native();
+    if (s.size() >= 3 && s[1] == L':' && (s[2] == L'\\' || s[2] == L'/')) {
+        if (s.size() < 4 || s.substr(0, 4) != L"\\\\?\\") {
+            std::wstring fixed = s;
+            for (auto& c : fixed) if (c == L'/') c = L'\\';
+            return std::filesystem::path(L"\\\\?\\" + fixed);
+        }
+    }
+#endif
+    return p;
+}
+
 // Path validation
 inline bool IsPathWithin(const std::string& root, const std::string& fullPath) {
     return Platform().IsPathWithin(root, fullPath);

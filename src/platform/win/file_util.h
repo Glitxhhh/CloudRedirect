@@ -72,6 +72,19 @@ inline std::filesystem::path Utf8ToPath(const std::string& utf8) {
     return std::filesystem::path(std::move(wide));
 }
 
+// Prepend \\?\ to absolute paths to bypass the 260-char MAX_PATH limit.
+inline std::filesystem::path LongPath(const std::filesystem::path& p) {
+    const auto& s = p.native();
+    if (s.size() >= 3 && s[1] == L':' && (s[2] == L'\\' || s[2] == L'/')) {
+        if (s.size() < 4 || s.substr(0, 4) != L"\\\\?\\") {
+            std::wstring fixed = s;
+            for (auto& c : fixed) if (c == L'/') c = L'\\';
+            return std::filesystem::path(L"\\\\?\\" + fixed);
+        }
+    }
+    return p;
+}
+
 // Returns true if fullPath resolves under root (case-insensitive on Windows).
 // Used to block path traversal in blob-storage modules.
 inline bool IsPathWithin(const std::string& root, const std::string& fullPath) {
@@ -210,18 +223,18 @@ inline bool WriteFlushAndRename(const std::filesystem::path& pathFs,
 inline bool AtomicWriteBinary(const std::string& path, const void* data, size_t len,
                               DWORD* lastError = nullptr) {
     static std::atomic<uint32_t> s_seq{0};
-    auto pathFs = Utf8ToPath(path);
+    auto pathFs = LongPath(Utf8ToPath(path));
     std::string tmpSuffix = ".tmp." + std::to_string(GetCurrentThreadId()) + "." + std::to_string(s_seq.fetch_add(1, std::memory_order_relaxed));
-    auto tmpPathFs = Utf8ToPath(path + tmpSuffix);
+    auto tmpPathFs = LongPath(Utf8ToPath(path + tmpSuffix));
     if (pathFs.empty() || tmpPathFs.empty()) return false;
     return WriteFlushAndRename(pathFs, tmpPathFs, data, len, lastError);
 }
 
 inline bool AtomicWriteText(const std::string& path, const std::string& content) {
     static std::atomic<uint32_t> s_seq{0};
-    auto pathFs = Utf8ToPath(path);
+    auto pathFs = LongPath(Utf8ToPath(path));
     std::string tmpSuffix = ".tmp." + std::to_string(GetCurrentThreadId()) + "." + std::to_string(s_seq.fetch_add(1, std::memory_order_relaxed));
-    auto tmpPathFs = Utf8ToPath(path + tmpSuffix);
+    auto tmpPathFs = LongPath(Utf8ToPath(path + tmpSuffix));
     if (pathFs.empty() || tmpPathFs.empty()) return false;
     return WriteFlushAndRename(pathFs, tmpPathFs, content.data(), content.size());
 }
