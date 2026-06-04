@@ -30,8 +30,8 @@ CloudRedirect for Windows consists of a C++ DLL and a WPF companion app:
 
 1. The companion app patches the SteamTools payload to load the CloudRedirect DLL at startup.
 2. The DLL hooks Steam's internal cloud save RPC handlers via ~~vtable interception~~ black magic.
-3. When a lua game attempts to read or write cloud save data, the DLL intercepts the calls and redirects them to a local cache directory. If the game is owned, the game uses normal Steam Cloud as expected. If a lua is present that only unlocks DLC, the game will use normal Steam Cloud.
-4. More dark magic occurs and the saves are synced to or from your chosen cloud provider. This all is visible in the Steam UI and looks identical to normal Steam Cloud functionality.
+3. When a lua game attempts to read or write cloud save data, the DLL intercepts the calls and redirects it. If the game is owned, the game uses normal Steam Cloud as expected. If a lua is present that only unlocks DLC, the game will use normal Steam Cloud.
+4. More dark magic occurs. Saves sync. Bytes flow. This all is visible in the Steam UI and looks identical to normal Steam Cloud functionality.
 
 Same rough idea on Linux, but involving a flatpak application and a library that is loaded on steam startup instead. 
    
@@ -41,7 +41,7 @@ Same rough idea on Linux, but involving a flatpak application and a library that
 - **OneDrive**
 - **Local folder / mapped drive** -- by request of literally one user.
 
-With more to come over time.
+With more to come over time. 
 
 ## Usage (Windows)
 
@@ -98,4 +98,3 @@ If you are building under Ubuntu 20.04, GCC 12 is needed along with the 32-bit m
 Then specify -DLINUX_32BIT=ON and wham bam.
 
 Isn't building for weird distros _fun?_
-
