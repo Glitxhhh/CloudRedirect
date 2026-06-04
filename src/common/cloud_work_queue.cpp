@@ -588,9 +588,22 @@ bool DrainQueueForApp(uint32_t accountId, uint32_t appId) {
     std::string prefix = std::to_string(accountId) + "/" + std::to_string(appId) + "/";
 
     constexpr int POLL_MS = 100;
-    constexpr int TIMEOUT_MS = 30000;
+    constexpr int BASE_TIMEOUT_MS = 30000;
+    constexpr int PER_ITEM_MS = 3000;
+    constexpr int MAX_TIMEOUT_MS = 180000;
+
+    // Scale timeout with pending work count.
+    int pendingCount = 0;
+    {
+        std::lock_guard<std::mutex> countLock(g_queueMutex);
+        for (const auto& item : g_workQueue)
+            if (!item.bestEffort && item.cloudPath.rfind(prefix, 0) == 0)
+                ++pendingCount;
+    }
+    int timeoutMs = (std::min)(MAX_TIMEOUT_MS, BASE_TIMEOUT_MS + pendingCount * PER_ITEM_MS);
+
     auto start = std::chrono::steady_clock::now();
-    auto deadline = start + std::chrono::milliseconds(TIMEOUT_MS);
+    auto deadline = start + std::chrono::milliseconds(timeoutMs);
 
     std::unique_lock<std::mutex> lock(g_queueMutex);
     RequeueFailedWorkForPrefixLocked(prefix);
