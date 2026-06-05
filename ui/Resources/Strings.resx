@@ -1617,6 +1617,12 @@ Are you sure?</value>
   <data name="Settings_AutoUpdateDllHint" xml:space="preserve">
     <value>Automatically check for and install newer versions of the CloudRedirect DLL when Steam launches. The update takes effect on the next Steam restart.</value>
   </data>
+  <data name="Settings_ShowNonSteamGame" xml:space="preserve">
+    <value>Show Game in Friends</value>
+  </data>
+  <data name="Settings_ShowNonSteamGameHint" xml:space="preserve">
+    <value>When playing a game unlocked by a Lua, show it as "Playing non-Steam game" in your friends list instead of appearing offline. Takes effect on next game launch.</value>
+  </data>
 
   <!-- ═══════════════════════════════════════════════════════════════════ -->
   <!-- Cloud Redirect Toggle                                               -->

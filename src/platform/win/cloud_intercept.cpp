@@ -321,6 +321,7 @@ static std::atomic<bool> g_cloudRedirectEnabled{true};
 // Config lives in Steam folder (per-system), NOT AppData (per-user).
 static std::atomic<bool> g_manifestPinsEnabled{false};
 static std::atomic<bool> g_autoComment{true};  // when true, ignore lua setManifestid lines
+static std::atomic<bool> g_showNonSteamGame{true};  // show LUA games as "Playing non-Steam game" in friends
 static std::unordered_set<uint32_t> g_pinnedApps;  // per-app overrides: always respect lua pins for these apps
 static std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint64_t>> g_manifestPins;  // appId -> {depotId -> manifestId}
 
@@ -3766,6 +3767,8 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
                 g_manifestPinsEnabled = pinCfg["manifest_pinning"].boolean();
             if (pinCfg["auto_comment"].type == Json::Type::Bool)
                 g_autoComment = pinCfg["auto_comment"].boolean();
+            if (pinCfg["show_non_steam_game"].type == Json::Type::Bool)
+                g_showNonSteamGame = pinCfg["show_non_steam_game"].boolean();
 
             size_t totalPins = 0;
 
@@ -4372,6 +4375,10 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
 
 void InstallGamesPlayedHook() {
     if (!HasNamespaceApps()) return;
+    if (!g_showNonSteamGame.load(std::memory_order_relaxed)) {
+        LOG("[GamesPlayed] Disabled by config (show_non_steam_game=false)");
+        return;
+    }
 
     HMODULE hSteamClient = GetModuleHandleA("steamclient64.dll");
     if (!hSteamClient) {

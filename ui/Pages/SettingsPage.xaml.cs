@@ -60,6 +60,7 @@ public partial class SettingsPage : Page
         bool? SyncPlaytime,
         bool? SyncLuas,
         bool? AutoUpdateDll,
+        bool? ShowNonSteamGame,
         bool? ParentalIgnorePlaytime,
         bool? ParentalBypassPlaytime);
 
@@ -75,11 +76,11 @@ public partial class SettingsPage : Page
             var lang = ReadLanguageSetting();
             var mode = Services.SteamDetector.ReadModeSetting();
 
-            bool? a = null, p = null, l = null, u = null, pip = null, pbp = null;
+            bool? a = null, p = null, l = null, u = null, nsg = null, pip = null, pbp = null;
             if (mode == "cloud_redirect")
-                ReadSyncTogglesInto(ref a, ref p, ref l, ref u, ref pip, ref pbp);
+                ReadSyncTogglesInto(ref a, ref p, ref l, ref u, ref nsg, ref pip, ref pbp);
 
-            return new SettingsSnapshot(lang, mode, a, p, l, u, pip, pbp);
+            return new SettingsSnapshot(lang, mode, a, p, l, u, nsg, pip, pbp);
         });
 
         ApplySettingsSnapshot(snapshot);
@@ -94,12 +95,12 @@ public partial class SettingsPage : Page
         {
             SyncSection.Visibility = Visibility.Visible;
             ApplySyncToggles(snap.SyncAchievements, snap.SyncPlaytime, snap.SyncLuas, snap.AutoUpdateDll,
-                             snap.ParentalIgnorePlaytime, snap.ParentalBypassPlaytime);
+                             snap.ShowNonSteamGame, snap.ParentalIgnorePlaytime, snap.ParentalBypassPlaytime);
         }
         else
         {
             SyncSection.Visibility = Visibility.Collapsed;
-            ApplySyncToggles(false, false, false, false,
+            ApplySyncToggles(false, false, false, false, false,
                              snap.ParentalIgnorePlaytime, snap.ParentalBypassPlaytime);
         }
     }
@@ -130,7 +131,7 @@ public partial class SettingsPage : Page
     }
 
     private void ApplySyncToggles(bool? achievements, bool? playtime, bool? luas, bool? autoUpdateDll,
-                                   bool? parentalIgnorePlaytime, bool? parentalBypassPlaytime)
+                                   bool? showNonSteamGame, bool? parentalIgnorePlaytime, bool? parentalBypassPlaytime)
     {
         _syncLoading = true;
         try
@@ -139,6 +140,7 @@ public partial class SettingsPage : Page
             if (playtime == true) SyncPlaytimeToggle.IsChecked = true;
             if (luas == true) SyncLuasToggle.IsChecked = true;
             if (autoUpdateDll == true) AutoUpdateDllToggle.IsChecked = true;
+            if (showNonSteamGame == true) ShowNonSteamGameToggle.IsChecked = true;
             if (parentalIgnorePlaytime == true) ParentalIgnorePlaytimeToggle.IsChecked = true;
             if (parentalBypassPlaytime == true) ParentalBypassPlaytimeToggle.IsChecked = true;
         }
@@ -154,7 +156,7 @@ public partial class SettingsPage : Page
     /// path never opens config.json synchronously.
     /// </summary>
     private static void ReadSyncTogglesInto(ref bool? achievements, ref bool? playtime, ref bool? luas, ref bool? autoUpdateDll,
-                                              ref bool? parentalIgnorePlaytime, ref bool? parentalBypassPlaytime)
+                                              ref bool? showNonSteamGame, ref bool? parentalIgnorePlaytime, ref bool? parentalBypassPlaytime)
     {
         try
         {
@@ -175,6 +177,10 @@ public partial class SettingsPage : Page
                 autoUpdateDll = u.ValueKind == JsonValueKind.True;
             else
                 autoUpdateDll = true; // default on when key absent
+            if (root.TryGetProperty("show_non_steam_game", out var nsg))
+                showNonSteamGame = nsg.ValueKind == JsonValueKind.True;
+            else
+                showNonSteamGame = true; // default on when key absent
             if (root.TryGetProperty("parental_ignore_playtime", out var pip) && pip.ValueKind == JsonValueKind.True)
                 parentalIgnorePlaytime = true;
             if (root.TryGetProperty("parental_bypass_playtime", out var pbp) && pbp.ValueKind == JsonValueKind.True)
@@ -344,13 +350,14 @@ public partial class SettingsPage : Page
         var path = GetConfigPath();
         Services.ConfigHelper.SaveConfig(path,
             new[] { "sync_achievements", "sync_playtime", "sync_luas", "auto_update_dll",
-                    "parental_ignore_playtime", "parental_bypass_playtime" },
+                    "show_non_steam_game", "parental_ignore_playtime", "parental_bypass_playtime" },
             writer =>
             {
                 writer.WriteBoolean("sync_achievements", SyncAchievementsToggle.IsChecked == true);
                 writer.WriteBoolean("sync_playtime", SyncPlaytimeToggle.IsChecked == true);
                 writer.WriteBoolean("sync_luas", SyncLuasToggle.IsChecked == true);
                 writer.WriteBoolean("auto_update_dll", AutoUpdateDllToggle.IsChecked == true);
+                writer.WriteBoolean("show_non_steam_game", ShowNonSteamGameToggle.IsChecked == true);
                 writer.WriteBoolean("parental_ignore_playtime", ParentalIgnorePlaytimeToggle.IsChecked == true);
                 writer.WriteBoolean("parental_bypass_playtime", ParentalBypassPlaytimeToggle.IsChecked == true);
             });
