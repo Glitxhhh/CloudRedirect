@@ -175,6 +175,7 @@ ApplicationWindow {
             TabButton { text: "Backups" }
             TabButton { text: "Cloud Provider" }
             TabButton { text: "Setup" }
+            TabButton { text: "Stats Sync" }
         }
 
         StackLayout {
@@ -187,6 +188,7 @@ ApplicationWindow {
             BackupsPage {}
             CloudProviderPage {}
             SetupPage {}
+            StatsPage {}
         }
     }
 }

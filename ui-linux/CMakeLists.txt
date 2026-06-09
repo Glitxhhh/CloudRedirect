@@ -68,6 +68,7 @@ qt_add_qml_module(cloud-redirect-ui
         qml/pages/AppsPage.qml
         qml/pages/BackupsPage.qml
         qml/pages/CloudProviderPage.qml
+        qml/pages/StatsPage.qml
 )
 
 target_include_directories(cloud-redirect-ui PRIVATE src)

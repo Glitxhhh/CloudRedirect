@@ -4187,8 +4187,8 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             if (cfg["sync_luas"].type == Json::Type::Bool)
                 MetadataSync::syncLuas = cfg["sync_luas"].boolean();
         }
-        // Native stats/playtime sync gates. Absent -> keep default (ON). When
-        // off, the matching native path does not interfere with Steam at all.
+        // Native stats/playtime sync gates. Absent -> keep default (OFF, WIP).
+        // When off, the matching native path does not interfere with Steam at all.
         if (cfg["sync_achievements"].type == Json::Type::Bool)
             MetadataSync::syncAchievements = cfg["sync_achievements"].boolean();
         if (cfg["sync_playtime"].type == Json::Type::Bool)

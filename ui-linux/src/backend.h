@@ -21,6 +21,8 @@ class Backend : public QObject
     Q_PROPERTY(QString syncFolderPath READ syncFolderPath WRITE setSyncFolderPath NOTIFY settingsChanged)
     Q_PROPERTY(bool providerAuthenticated READ providerAuthenticated NOTIFY settingsChanged)
     Q_PROPERTY(bool notificationsEnabled READ notificationsEnabled WRITE setNotificationsEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(bool syncAchievements READ syncAchievements WRITE setSyncAchievements NOTIFY settingsChanged)
+    Q_PROPERTY(bool syncPlaytime READ syncPlaytime WRITE setSyncPlaytime NOTIFY settingsChanged)
     Q_PROPERTY(QString accountId READ accountId NOTIFY statusChanged)
     Q_PROPERTY(QString accountName READ accountName NOTIFY statusChanged)
     Q_PROPERTY(QString version READ version CONSTANT)
@@ -46,6 +48,10 @@ public:
     bool providerAuthenticated() const;
     bool notificationsEnabled() const;
     void setNotificationsEnabled(bool enabled);
+    bool syncAchievements() const;
+    void setSyncAchievements(bool enabled);
+    bool syncPlaytime() const;
+    void setSyncPlaytime(bool enabled);
 
     Q_INVOKABLE QVariantList getManagedApps();
     Q_INVOKABLE QVariantList getAppDetails();
@@ -111,6 +117,11 @@ private:
     QString m_syncFolderPath;
     bool m_providerAuthenticated = false;
     bool m_notificationsEnabled = true;
+    // Stats sync gates -- mirror the native MetadataSync flags / config keys the
+    // Linux side honors (schema fetch is Windows-only, so it is not exposed here).
+    // Default OFF: WIP opt-in features.
+    bool m_syncAchievements = false;
+    bool m_syncPlaytime = false;
 
     struct AppInfo {
         uint32_t appId;
