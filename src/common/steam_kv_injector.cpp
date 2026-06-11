@@ -402,16 +402,16 @@ bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
 
 #else // !_WIN32 -- Linux 32-bit steamclient.so
 
-// Linux steamclient.so -- runtime signature scanning; falls back to hardcoded RVAs (May 2026 build)
+// Linux steamclient.so -- runtime signature scanning; falls back to hardcoded RVAs (build 1781043450)
 
-// Fallback RVAs (June 2026 steamclient.so, IDA image base 0x0).
-static constexpr uintptr_t FALLBACK_RVA_GLOBAL_ENGINE   = 0x2ECD9C0;
-static constexpr uintptr_t FALLBACK_RVA_READ_CONFIG_U64 = 0xF76960;
-static constexpr uintptr_t FALLBACK_RVA_GET_SECTION     = 0xF75BD0;
-static constexpr uintptr_t FALLBACK_RVA_KV_FIND_KEY     = 0x2513320;
-static constexpr uintptr_t FALLBACK_RVA_KV_SET_UINT64   = 0x250E070;
-static constexpr uintptr_t FALLBACK_RVA_KV_SET_INT32    = 0x250E040;
-static constexpr uintptr_t FALLBACK_RVA_KV_SET_STRING   = 0x250DEE0;
+// Fallback RVAs (steamclient.so build 1781043450, IDA image base 0x0).
+static constexpr uintptr_t FALLBACK_RVA_GLOBAL_ENGINE   = 0x2ED1BC0;
+static constexpr uintptr_t FALLBACK_RVA_READ_CONFIG_U64 = 0xF77960;
+static constexpr uintptr_t FALLBACK_RVA_GET_SECTION     = 0xF74EC0;
+static constexpr uintptr_t FALLBACK_RVA_KV_FIND_KEY     = 0x2517320;
+static constexpr uintptr_t FALLBACK_RVA_KV_SET_UINT64   = 0x2512070;
+static constexpr uintptr_t FALLBACK_RVA_KV_SET_INT32    = 0x2512040;
+static constexpr uintptr_t FALLBACK_RVA_KV_SET_STRING   = 0x2511EE0;
 
 // Offset from CSteamEngine* to CAppInfoCache instance.
 static constexpr uintptr_t APPINFOCACHE_OFFSET = 2952; // 0xB88
@@ -793,8 +793,10 @@ bool Init() {
             g_r.kvSetInt32      = reinterpret_cast<KvSetInt32Fn>(kvSetI32 ? kvSetI32 : (base + FALLBACK_RVA_KV_SET_INT32));
             g_r.kvSetString     = reinterpret_cast<KvSetStringFn>(kvSetStr ? kvSetStr : (base + FALLBACK_RVA_KV_SET_STRING));
 
-            // If critical functions couldn't be sig-scanned, don't trust fallback RVAs
-            if (!globalEng || !getSect || !kvFind) {
+            // Don't trust fallback RVAs if criticals couldn't be sig-scanned.
+            // readConfigU64 is included: a stale fallback there crashes in
+            // steamclient's BST walk on the first GetChangelist RPC.
+            if (!globalEng || !getSect || !kvFind || !readCfg) {
                 LOG("[KvInjector] Critical functions unresolved -- KV injector DISABLED (prevents crash on stale RVAs)");
                 return;
             }
