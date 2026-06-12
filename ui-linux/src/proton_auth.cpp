@@ -27,7 +27,7 @@
 #include <unistd.h>
 #include <string.h>
 
-static const char *kApiBase    = "https://api.proton.me";
+static const char *kApiBase    = "https://mail.proton.me/api";
 static const char *kAppVersion = "external-drive-cloudredirect@2.1.8-stable";
 
 // ── Base64 / Hex helpers ───────────────────────────────────────────────────────

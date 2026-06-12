@@ -20,7 +20,7 @@ namespace CloudRedirect.Services;
 /// </summary>
 internal static class ProtonSrpService
 {
-    private const string ApiBase    = "https://api.proton.me";
+    private const string ApiBase    = "https://mail.proton.me/api";
     private const string AppVersion = "external-drive-cloudredirect@2.1.8-stable";
 
     public static async Task<bool> AuthorizeAsync(
