@@ -14,6 +14,8 @@ finish-args:
 
   # Network access for OAuth and cloud provider APIs
   - --share=network
+  # Allow Qt's SSL stack to read the host CA certificate bundle
+  - --filesystem=/etc/ssl:ro
 
   # Display
   - --socket=wayland

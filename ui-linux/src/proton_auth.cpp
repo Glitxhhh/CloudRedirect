@@ -403,9 +403,10 @@ void ProtonAuthService::postJson(const QString &path, const QByteArray &body,
         req.setRawHeader("Authorization", ("Bearer " + m_accessToken).toUtf8());
     }
     auto *reply = m_nam->post(req, body);
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, cb]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
+            emit statusMessage("Network error: " + reply->errorString());
             cb(false, {});
         } else {
             cb(true, reply->readAll());
@@ -424,9 +425,10 @@ void ProtonAuthService::getJson(const QString &path,
         req.setRawHeader("Authorization", ("Bearer " + m_accessToken).toUtf8());
     }
     auto *reply = m_nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, cb]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
+            emit statusMessage("Network error: " + reply->errorString());
             cb(false, {});
         } else {
             cb(true, reply->readAll());
