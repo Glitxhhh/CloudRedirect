@@ -403,11 +403,10 @@ void ProtonAuthService::postJson(const QString &path, const QByteArray &body,
         req.setRawHeader("Authorization", ("Bearer " + m_accessToken).toUtf8());
     }
     auto *reply = m_nam->post(req, body);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, cb]() {
+    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
-            emit statusMessage("Network error: " + reply->errorString());
-            cb(false, {});
+            cb(false, reply->errorString().toUtf8());
         } else {
             cb(true, reply->readAll());
         }
@@ -425,11 +424,10 @@ void ProtonAuthService::getJson(const QString &path,
         req.setRawHeader("Authorization", ("Bearer " + m_accessToken).toUtf8());
     }
     auto *reply = m_nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, cb]() {
+    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
-            emit statusMessage("Network error: " + reply->errorString());
-            cb(false, {});
+            cb(false, reply->errorString().toUtf8());
         } else {
             cb(true, reply->readAll());
         }
@@ -715,7 +713,7 @@ void ProtonAuthService::stepFetchInfo()
     infoObj["Intent"]   = QString("Proton");
     QByteArray body = QJsonDocument(infoObj).toJson(QJsonDocument::Compact);
     postJson("/auth/v4/info", body, [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error on /auth/v4/info"); return; }
+        if (!ok) { emit failed("Network error on /auth/v4/info: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
         if (j["Code"].toInt() != 1000) {
             emit failed(QString("SRP info failed: Code %1").arg(j["Code"].toInt())); return;
@@ -751,7 +749,7 @@ void ProtonAuthService::stepAuthenticate(const QString &modHex, const QString &s
     QByteArray body = QJsonDocument(authObj).toJson(QJsonDocument::Compact);
 
     postJson("/auth/v4", body, [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error on /auth/v4"); return; }
+        if (!ok) { emit failed("Network error on /auth/v4: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
         int code = j["Code"].toInt();
         if (code != 1000) {
@@ -770,7 +768,7 @@ void ProtonAuthService::stepFetchSalts()
 {
     emit statusMessage("Fetching key salts...");
     getJson("/core/v4/keys/salts", [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error on /core/v4/keys/salts"); return; }
+        if (!ok) { emit failed("Network error on /core/v4/keys/salts: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
         QJsonArray salts = j["KeySalts"].toArray();
         for (const QJsonValue &v : salts) {
@@ -785,7 +783,7 @@ void ProtonAuthService::stepFetchUserKey()
 {
     emit statusMessage("Fetching user keys...");
     getJson("/core/v4/users", [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error on /core/v4/users"); return; }
+        if (!ok) { emit failed("Network error on /core/v4/users: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
         QJsonArray keys = j["User"].toObject()["Keys"].toArray();
         QString primaryKey;
@@ -830,7 +828,7 @@ void ProtonAuthService::stepFetchAddresses()
 {
     emit statusMessage("Fetching address keys...");
     getJson("/core/v4/addresses", [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error on /core/v4/addresses"); return; }
+        if (!ok) { emit failed("Network error on /core/v4/addresses: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
         QJsonArray addresses = j["Addresses"].toArray();
         for (const QJsonValue &av : addresses) {
@@ -876,7 +874,7 @@ void ProtonAuthService::stepFetchVolumes()
 {
     emit statusMessage("Fetching drive metadata...");
     getJson("/drive/v2/volumes", [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error on /drive/v2/volumes"); return; }
+        if (!ok) { emit failed("Network error on /drive/v2/volumes: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
         QJsonArray vols = j["Volumes"].toArray();
         if (vols.isEmpty()) { emit failed("No Drive volume found"); return; }
@@ -891,7 +889,7 @@ void ProtonAuthService::stepFetchShares(const QString &volumeId)
     m_volumeId = volumeId;
     getJson("/drive/v2/volumes/" + volumeId + "/shares",
             [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error fetching shares"); return; }
+        if (!ok) { emit failed("Network error fetching shares: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
         QJsonArray shares = j["Shares"].toArray();
         for (const QJsonValue &sv : shares) {
