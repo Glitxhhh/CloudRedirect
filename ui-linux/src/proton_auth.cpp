@@ -37,34 +37,25 @@ static QString    toB64(const QByteArray &b)  { return QString::fromLatin1(b.toB
 static QByteArray fromHex(const QString &s)   { return QByteArray::fromHex(s.toUtf8());    }
 
 // The Modulus field in /auth/v4/info is a PGP-signed message; extract the hex body.
-// The hex may be line-wrapped — strip all whitespace.
+// Handles any line-ending convention (\n, \r\n, \r).
 static QString parseSrpModulus(const QString &pgpSigned)
 {
-    int blank = pgpSigned.indexOf("\n\n");
-    if (blank < 0) return pgpSigned;
-    int bodyStart = blank + 2;
-    int sigStart = pgpSigned.indexOf("\n-----BEGIN PGP", bodyStart);
-    QString hex = (sigStart >= 0)
-        ? pgpSigned.mid(bodyStart, sigStart - bodyStart)
-        : pgpSigned.mid(bodyStart);
-    hex.remove('\n'); hex.remove('\r'); hex.remove(' ');
-    return hex;
-}
-
-// Reverse a byte array (little-endian ↔ big-endian conversion).
-static QByteArray revBytes(const QByteArray &b)
-{
-    QByteArray r(b.size(), '\0');
-    for (int i = 0; i < b.size(); ++i) r[i] = b[b.size()-1-i];
-    return r;
-}
-
-// Serialize a BIGNUM as little-endian bytes padded to `len`.
-static QByteArray bnToLE(const BIGNUM *n, int len)
-{
-    QByteArray be(len, '\0');
-    BN_bn2binpad(n, (uint8_t *)be.data(), len);
-    return revBytes(be);
+    QStringList lines = pgpSigned.split(QRegularExpression("\r\n|\n|\r"));
+    bool inBody = false;
+    QString result;
+    for (const QString &line : lines) {
+        if (!inBody) {
+            if (line.trimmed().isEmpty()) inBody = true;
+            continue;
+        }
+        if (line.startsWith("-----")) break;
+        for (QChar c : line) {
+            ushort u = c.unicode();
+            if ((u >= '0' && u <= '9') || (u >= 'a' && u <= 'f') || (u >= 'A' && u <= 'F'))
+                result += c;
+        }
+    }
+    return result;
 }
 
 // ── PGP low-level helpers ─────────────────────────────────────────────────────
@@ -527,8 +518,7 @@ bool ProtonAuthService::computeSrp(const QByteArray &modBytes,
                                     QByteArray &outClientEph,
                                     QByteArray &outProof)
 {
-    // Proton SRP uses little-endian byte representation for all big integers.
-    // modBytes and serverEphBytes arrive as LE from the API; reverse to load into OpenSSL BIGNUMs.
+    // Proton's go-srp reference uses standard big-endian big.Int throughout.
     int modLen = modBytes.size();
 
     BN_CTX *ctx = BN_CTX_new();
@@ -539,39 +529,36 @@ bool ProtonAuthService::computeSrp(const QByteArray &modBytes,
     BIGNUM *S  = BN_new(), *Bgx = BN_new(), *exp_ = BN_new(), *ux = BN_new();
     bool ok = false;
 
-    // Load N from LE bytes (reverse to get big-endian for OpenSSL)
-    QByteArray modRev = revBytes(modBytes);
-    BN_bin2bn((const uint8_t *)modRev.constData(), modLen, N);
+    BN_bin2bn((const uint8_t *)modBytes.constData(), modLen, N);
     BN_set_word(g, 2);
 
     // Random a in (1, N)
     do { BN_rand_range(a, N); } while (BN_cmp(a, BN_value_one()) <= 0);
     BN_mod_exp(A, g, a, N, ctx);
 
-    // Serialize A as little-endian — this is what we send as ClientEphemeral
-    QByteArray A_LE = bnToLE(A, modLen);
-    outClientEph = A_LE;
+    // A padded to modLen (big-endian)
+    outClientEph.resize(modLen);
+    BN_bn2binpad(A, (uint8_t *)outClientEph.data(), modLen);
 
-    // serverEphBytes are already LE; pad to modLen, then load reversed for arithmetic
-    QByteArray B_LE = serverEphBytes;
-    while (B_LE.size() < modLen) B_LE.append('\0');
-    BN_bin2bn((const uint8_t *)revBytes(B_LE).constData(), modLen, B);
+    // B from server ephemeral bytes (big-endian), padded for hashing
+    BN_bin2bn((const uint8_t *)serverEphBytes.constData(), serverEphBytes.size(), B);
+    QByteArray Bbytes(modLen, '\0');
+    BN_bn2binpad(B, (uint8_t *)Bbytes.data(), modLen);
 
-    // u = SHA-512(A_LE || B_LE), interpreted as little-endian integer
+    // u = SHA-512(A || B)
     {
         uint8_t uHash[64];
         EVP_MD_CTX *mctx = EVP_MD_CTX_new();
         EVP_DigestInit_ex(mctx, EVP_sha512(), nullptr);
-        EVP_DigestUpdate(mctx, A_LE.constData(), A_LE.size());
-        EVP_DigestUpdate(mctx, B_LE.constData(), B_LE.size());
+        EVP_DigestUpdate(mctx, outClientEph.constData(), outClientEph.size());
+        EVP_DigestUpdate(mctx, Bbytes.constData(), Bbytes.size());
         unsigned int hl = 64;
         EVP_DigestFinal_ex(mctx, uHash, &hl);
         EVP_MD_CTX_free(mctx);
-        QByteArray uRev = revBytes(QByteArray((const char *)uHash, 64));
-        BN_bin2bn((const uint8_t *)uRev.constData(), 64, u);
+        BN_bin2bn(uHash, 64, u);
     }
 
-    // x = SHA-512(salt || passExpanded), interpreted as little-endian integer
+    // x = SHA-512(salt || passExpanded)
     {
         uint8_t xHash[64];
         EVP_MD_CTX *mctx = EVP_MD_CTX_new();
@@ -581,8 +568,7 @@ bool ProtonAuthService::computeSrp(const QByteArray &modBytes,
         unsigned int hl = 64;
         EVP_DigestFinal_ex(mctx, xHash, &hl);
         EVP_MD_CTX_free(mctx);
-        QByteArray xRev = revBytes(QByteArray((const char *)xHash, 64));
-        BN_bin2bn((const uint8_t *)xRev.constData(), 64, x);
+        BN_bin2bn(xHash, 64, x);
     }
 
     BN_mod_exp(gx, g, x, N, ctx);
@@ -591,20 +577,16 @@ bool ProtonAuthService::computeSrp(const QByteArray &modBytes,
     BN_add(exp_, a, ux);
     BN_mod_exp(S, Bgx, exp_, N, ctx);
 
-    // S serialized as little-endian
-    QByteArray S_LE = bnToLE(S, modLen);
-
-    // K = SHA-512(S_LE)
+    QByteArray Sbytes(modLen, '\0');
+    BN_bn2binpad(S, (uint8_t *)Sbytes.data(), modLen);
     uint8_t K[64];
-    SHA512((const uint8_t *)S_LE.constData(), S_LE.size(), K);
+    SHA512((const uint8_t *)Sbytes.constData(), Sbytes.size(), K);
 
-    // Proof = SHA-512(H(N_LE) XOR H(g) || zeros64 || salt || A_LE || B_LE || K)
-    // modBytes IS the LE representation of N as received from the API
+    // Proof = SHA-512(H(N) XOR H(g) || zeros64 || salt || A || B || K)
     uint8_t hN[64], hG[64];
     SHA512((const uint8_t *)modBytes.constData(), modLen, hN);
     uint8_t gByte = 2;
     SHA512(&gByte, 1, hG);
-
     uint8_t hXor[64];
     for (int i = 0; i < 64; ++i) hXor[i] = hN[i] ^ hG[i];
 
@@ -616,8 +598,8 @@ bool ProtonAuthService::computeSrp(const QByteArray &modBytes,
         uint8_t zeros[64] = {};
         EVP_DigestUpdate(mctx, zeros, 64);
         EVP_DigestUpdate(mctx, srpSaltBytes.constData(), srpSaltBytes.size());
-        EVP_DigestUpdate(mctx, A_LE.constData(), A_LE.size());
-        EVP_DigestUpdate(mctx, B_LE.constData(), B_LE.size());
+        EVP_DigestUpdate(mctx, outClientEph.constData(), outClientEph.size());
+        EVP_DigestUpdate(mctx, Bbytes.constData(), Bbytes.size());
         EVP_DigestUpdate(mctx, K, 64);
         unsigned int hl = 64;
         EVP_DigestFinal_ex(mctx, proof, &hl);
