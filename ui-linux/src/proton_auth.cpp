@@ -36,6 +36,19 @@ static QByteArray fromB64(const QString &s)  { return QByteArray::fromBase64(s.t
 static QString    toB64(const QByteArray &b)  { return QString::fromLatin1(b.toBase64());  }
 static QByteArray fromHex(const QString &s)   { return QByteArray::fromHex(s.toUtf8());    }
 
+// The Modulus field in /auth/v4/info is a PGP-signed message; extract the hex body.
+static QString parseSrpModulus(const QString &pgpSigned)
+{
+    int blank = pgpSigned.indexOf("\n\n");
+    if (blank < 0) return pgpSigned;
+    int bodyStart = blank + 2;
+    int sigStart = pgpSigned.indexOf("\n-----BEGIN PGP", bodyStart);
+    QString hex = (sigStart >= 0)
+        ? pgpSigned.mid(bodyStart, sigStart - bodyStart)
+        : pgpSigned.mid(bodyStart);
+    return hex.trimmed();
+}
+
 // ── PGP low-level helpers ─────────────────────────────────────────────────────
 
 static bool pgpDearmor(const QString &armored, QByteArray &out)
@@ -729,7 +742,7 @@ void ProtonAuthService::stepAuthenticate(const QString &modHex, const QString &s
                                           int version)
 {
     emit statusMessage("Computing SRP proof...");
-    QByteArray modBytes     = fromHex(modHex);
+    QByteArray modBytes     = fromHex(parseSrpModulus(modHex));
     QByteArray saltBytes    = fromB64(srpSaltB64);
     QByteArray serverEphB   = fromB64(serverEphB64);
     QByteArray passExpanded = expandPassword(m_password, version, saltBytes);

@@ -68,7 +68,7 @@ internal static class ProtonSrpService
 
             // ── Step 2: Client SRP proof ──────────────────────────────────────
             log("Computing SRP proof...");
-            byte[] modBytes    = FromHex(modHex);
+            byte[] modBytes    = FromHex(ParseSrpModulus(modHex));
             byte[] saltBytes   = FromB64(srpSalt);
             byte[] serverEphB  = FromB64(serverEph);
             byte[] passExpanded = ExpandPassword(password, srpVersion, saltBytes);
@@ -291,7 +291,7 @@ internal static class ProtonSrpService
 
     private static HttpClient BuildClient()
     {
-        var client = new HttpClient { BaseAddress = new Uri(ApiBase), Timeout = TimeSpan.FromSeconds(30) };
+        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
         client.DefaultRequestHeaders.TryAddWithoutValidation("x-pm-appversion", AppVersion);
         return client;
     }
@@ -299,7 +299,7 @@ internal static class ProtonSrpService
     private static async Task<JsonElement> PostJsonAsync(
         HttpClient http, string path, string body, CancellationToken cancel)
     {
-        using var req = new HttpRequestMessage(HttpMethod.Post, path)
+        using var req = new HttpRequestMessage(HttpMethod.Post, ApiBase + path)
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json")
         };
@@ -311,7 +311,7 @@ internal static class ProtonSrpService
     private static async Task<JsonElement> GetJsonAsync(
         HttpClient http, string path, CancellationToken cancel)
     {
-        var resp = await http.GetAsync(path, cancel);
+        var resp = await http.GetAsync(ApiBase + path, cancel);
         var json = await resp.Content.ReadAsStringAsync(cancel);
         return JsonDocument.Parse(json).RootElement.Clone();
     }
@@ -539,6 +539,18 @@ internal static class ProtonSrpService
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
+
+    // The Modulus field in /auth/v4/info is a PGP-signed message; extract the hex body.
+    private static string ParseSrpModulus(string pgpSigned)
+    {
+        int blank = pgpSigned.IndexOf("\n\n", StringComparison.Ordinal);
+        if (blank < 0) return pgpSigned;
+        int bodyStart = blank + 2;
+        int sigStart  = pgpSigned.IndexOf("\n-----BEGIN PGP", bodyStart, StringComparison.Ordinal);
+        return (sigStart >= 0
+            ? pgpSigned.Substring(bodyStart, sigStart - bodyStart)
+            : pgpSigned.Substring(bodyStart)).Trim();
+    }
 
     private static string ToB64(byte[] b)  => Convert.ToBase64String(b);
     private static byte[] FromB64(string s) => Convert.FromBase64String(s);
