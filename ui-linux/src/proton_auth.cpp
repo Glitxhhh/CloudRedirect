@@ -17,6 +17,8 @@
 #include <openssl/sha.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include <openssl/param_build.h>
+#include <openssl/core_names.h>
 
 #include <argon2.h>
 #include <crypt.h>
@@ -221,25 +223,60 @@ static bool pgpCfbDecrypt(const uint8_t *key, int keyLen,
     return true;
 }
 
-// RSA-OAEP-SHA1 decrypt with just n,e,d (no CRT params needed for one-shot auth).
+// RSA-OAEP-SHA1 decrypt with just n,e,d using EVP API (OpenSSL 3.x).
 static bool rsaOaepDecrypt(const QByteArray &n, const QByteArray &e, const QByteArray &d,
                             const uint8_t *ct, size_t ctLen, QByteArray &out)
 {
-    RSA *rsa = RSA_new();
-    if (!rsa) return false;
+    OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+    if (!bld) return false;
+
     BIGNUM *bn_n = BN_bin2bn((const uint8_t *)n.constData(), n.size(), nullptr);
     BIGNUM *bn_e = BN_bin2bn((const uint8_t *)e.constData(), e.size(), nullptr);
     BIGNUM *bn_d = BN_bin2bn((const uint8_t *)d.constData(), d.size(), nullptr);
-    if (!bn_n || !bn_e || !bn_d) {
-        BN_free(bn_n); BN_free(bn_e); BN_free(bn_d); RSA_free(rsa); return false;
+
+    EVP_PKEY *pkey = nullptr;
+    EVP_PKEY_CTX *ctx = nullptr;
+    bool ok = false;
+
+    if (!bn_n || !bn_e || !bn_d) goto cleanup;
+    if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, bn_n)) goto cleanup;
+    if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, bn_e)) goto cleanup;
+    if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_D, bn_d)) goto cleanup;
+
+    {
+        OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+        if (!params) goto cleanup;
+        EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr);
+        if (kctx) {
+            EVP_PKEY_fromdata_init(kctx);
+            EVP_PKEY_fromdata(kctx, &pkey, EVP_PKEY_KEYPAIR, params);
+            EVP_PKEY_CTX_free(kctx);
+        }
+        OSSL_PARAM_free(params);
     }
-    RSA_set0_key(rsa, bn_n, bn_e, bn_d);
-    out.resize(RSA_size(rsa));
-    int r = RSA_private_decrypt((int)ctLen, ct, (uint8_t *)out.data(), rsa, RSA_PKCS1_OAEP_PADDING);
-    RSA_free(rsa);
-    if (r < 0) { out.clear(); return false; }
-    out.resize(r);
-    return true;
+    if (!pkey) goto cleanup;
+
+    ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx) goto cleanup;
+    if (EVP_PKEY_decrypt_init(ctx) != 1) goto cleanup;
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) != 1) goto cleanup;
+    if (EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha1()) != 1) goto cleanup;
+    {
+        size_t outLen = 0;
+        if (EVP_PKEY_decrypt(ctx, nullptr, &outLen, ct, ctLen) != 1) goto cleanup;
+        out.resize((int)outLen);
+        if (EVP_PKEY_decrypt(ctx, (uint8_t *)out.data(), &outLen, ct, ctLen) != 1) goto cleanup;
+        out.resize((int)outLen);
+        ok = true;
+    }
+
+cleanup:
+    if (!ok) out.clear();
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    BN_free(bn_n); BN_free(bn_e); BN_free(bn_d);
+    OSSL_PARAM_BLD_free(bld);
+    return ok;
 }
 
 // ── PGP private key decryption ────────────────────────────────────────────────
@@ -671,9 +708,10 @@ bool ProtonAuthService::decryptPgpMessage(const QString &armored,
 void ProtonAuthService::stepFetchInfo()
 {
     emit statusMessage("Requesting SRP challenge...");
-    QByteArray body = "{\"Username\":" +
-                      QJsonDocument(QJsonValue(m_email)).toJson(QJsonDocument::Compact) +
-                      ",\"Intent\":\"Proton\"}";
+    QJsonObject infoObj;
+    infoObj["Username"] = m_email;
+    infoObj["Intent"]   = QString("Proton");
+    QByteArray body = QJsonDocument(infoObj).toJson(QJsonDocument::Compact);
     postJson("/auth/v4/info", body, [this](bool ok, const QByteArray &resp) {
         if (!ok) { emit failed("Network error on /auth/v4/info"); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
