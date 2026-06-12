@@ -44,7 +44,7 @@ modules:
     buildsystem: simple
     build-commands:
       - make OPTTARGET=''
-      - make install PREFIX=/app
+      - make install PREFIX=/app LIBRARY_REL=lib
     sources:
       - type: git
         url: https://github.com/P-H-C/phc-winner-argon2.git

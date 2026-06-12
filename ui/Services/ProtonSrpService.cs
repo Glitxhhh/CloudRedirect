@@ -293,7 +293,6 @@ internal static class ProtonSrpService
     {
         var client = new HttpClient { BaseAddress = new Uri(ApiBase), Timeout = TimeSpan.FromSeconds(30) };
         client.DefaultRequestHeaders.TryAddWithoutValidation("x-pm-appversion", AppVersion);
-        client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", AppVersion);
         return client;
     }
 
