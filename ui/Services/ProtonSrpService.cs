@@ -68,7 +68,7 @@ internal static class ProtonSrpService
             string sessionId  = GetStr(info, "SRPSession");
 
             // ── Step 2: Client SRP proof ──────────────────────────────────────
-            log("Computing SRP proof...");
+            log($"Computing SRP proof (version={srpVersion}, modLen={ParseSrpModulus(modHex).Length}, saltLen={FromB64(srpSalt).Length}, ephLen={FromB64(serverEph).Length})...");
             byte[] modBytes       = ParseSrpModulus(modHex);
             byte[] saltBytes      = FromB64(srpSalt);
             byte[] serverEphB     = FromB64(serverEph);
