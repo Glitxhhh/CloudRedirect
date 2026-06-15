@@ -474,11 +474,13 @@ void ProtonAuthService::postJson(const QString &path, const QByteArray &body,
     auto *reply = m_nam->post(req, body);
     connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
         reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError) {
-            cb(false, reply->errorString().toUtf8());
-        } else {
-            cb(true, reply->readAll());
-        }
+        QByteArray data = reply->readAll();
+        int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        bool ok = (httpStatus >= 200 && httpStatus < 300) ||
+                  (reply->error() == QNetworkReply::NoError);
+        if (!ok && data.isEmpty())
+            data = reply->errorString().toUtf8();
+        cb(ok, data);
     });
 }
 
@@ -495,11 +497,13 @@ void ProtonAuthService::getJson(const QString &path,
     auto *reply = m_nam->get(req);
     connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
         reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError) {
-            cb(false, reply->errorString().toUtf8());
-        } else {
-            cb(true, reply->readAll());
-        }
+        QByteArray data = reply->readAll();
+        int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        bool ok = (httpStatus >= 200 && httpStatus < 300) ||
+                  (reply->error() == QNetworkReply::NoError);
+        if (!ok && data.isEmpty())
+            data = reply->errorString().toUtf8();
+        cb(ok, data);
     });
 }
 
@@ -712,11 +716,14 @@ void ProtonAuthService::stepFetchInfo()
     emit statusMessage("Requesting SRP challenge...");
     QJsonObject infoObj;
     infoObj["Username"] = m_email;
-    infoObj["Intent"]   = QString("Proton");
     QByteArray body = QJsonDocument(infoObj).toJson(QJsonDocument::Compact);
     postJson("/auth/v4/info", body, [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error on /auth/v4/info: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
+        if (!ok) {
+            int code = j["Code"].toInt();
+            QString detail = code ? QString("Code %1").arg(code) : QString(resp);
+            emit failed("Network error on /auth/v4/info: " + detail); return;
+        }
         if (j["Code"].toInt() != 1000) {
             emit failed(QString("SRP info failed: Code %1").arg(j["Code"].toInt())); return;
         }
@@ -747,13 +754,15 @@ void ProtonAuthService::stepAuthenticate(const QString &modHex, const QString &s
     authObj["ClientEphemeral"] = toB64(clientEph);
     authObj["ClientProof"]     = toB64(proof);
     authObj["SRPSession"]      = sessionId;
-    authObj["Intent"]          = "Proton";
     QByteArray body = QJsonDocument(authObj).toJson(QJsonDocument::Compact);
 
     postJson("/auth/v4", body, [this](bool ok, const QByteArray &resp) {
-        if (!ok) { emit failed("Network error on /auth/v4: " + QString(resp)); return; }
         QJsonObject j = QJsonDocument::fromJson(resp).object();
         int code = j["Code"].toInt();
+        if (!ok) {
+            QString detail = code ? QString("Code %1").arg(code) : QString(resp);
+            emit failed("Network error on /auth/v4: " + detail); return;
+        }
         if (code != 1000) {
             QString msg = (code == 8002) ? "Incorrect password." : QString("Auth failed: Code %1").arg(code);
             emit failed(msg); return;

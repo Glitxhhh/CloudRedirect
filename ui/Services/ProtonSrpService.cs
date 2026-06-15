@@ -51,7 +51,7 @@ internal static class ProtonSrpService
             // ── Step 1: SRP challenge ─────────────────────────────────────────
             log("Requesting SRP challenge...");
             var info = await PostJsonAsync(http, "/auth/v4/info",
-                $"{{\"Username\":{JsonEscape(email)},\"Intent\":\"Proton\"}}",
+                $"{{\"Username\":{JsonEscape(email)}}}",
                 cancel);
 
             if (GetInt(info, "Code") != 1000)
@@ -80,8 +80,7 @@ internal static class ProtonSrpService
             string authBody = $"{{\"Username\":{JsonEscape(email)}," +
                               $"\"ClientEphemeral\":{JsonEscape(ToB64(clientEph))}," +
                               $"\"ClientProof\":{JsonEscape(ToB64(clientProof))}," +
-                              $"\"SRPSession\":{JsonEscape(sessionId)}," +
-                              $"\"Intent\":\"Proton\"}}";
+                              $"\"SRPSession\":{JsonEscape(sessionId)}}}";
 
             var auth = await PostJsonAsync(http, "/auth/v4", authBody, cancel);
             int authCode = GetInt(auth, "Code");
