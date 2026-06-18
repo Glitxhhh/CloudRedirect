@@ -1049,9 +1049,13 @@ void ProtonAuthService::stepAuthenticate(const QString &modHex, const QString &s
         m_accessToken  = j["AccessToken"].toString();
         m_refreshToken = j["RefreshToken"].toString();
         m_expiresAt    = QDateTime::currentSecsSinceEpoch() + j["ExpiresIn"].toInteger(3600);
-        if (j["TwoFactor"].toObject()["Enabled"].toInt() & 1) {
+        int twoFa = j["TwoFactor"].toObject()["Enabled"].toInt();
+        if (twoFa & 1) {
             emit statusMessage("Two-factor authentication required.");
             emit needsTwoFactor();
+        } else if (twoFa & 2) {
+            emit failed("Hardware security key (FIDO2) 2FA is not supported. "
+                        "Please switch to an authenticator app in your Proton account settings.");
         } else {
             stepFetchSalts();
         }

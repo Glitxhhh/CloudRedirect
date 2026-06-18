@@ -104,9 +104,18 @@ internal static class ProtonSrpService
                 new AuthenticationHeaderValue("Bearer", accessToken);
 
             // ── Step 3b: Two-factor authentication ────────────────────────────
-            bool twoFaRequired = auth.TryGetProperty("TwoFactor", out var tf)
+            int twoFaEnabled = auth.TryGetProperty("TwoFactor", out var tf)
                 && tf.TryGetProperty("Enabled", out var tfEnabled)
-                && (tfEnabled.GetInt32() & 1) != 0;
+                ? tfEnabled.GetInt32() : 0;
+
+            if ((twoFaEnabled & 1) == 0 && (twoFaEnabled & 2) != 0)
+            {
+                log("ERROR: Hardware security key (FIDO2) 2FA is not supported. " +
+                    "Please switch to an authenticator app in your Proton account settings.");
+                return false;
+            }
+
+            bool twoFaRequired = (twoFaEnabled & 1) != 0;
 
             if (twoFaRequired)
             {
