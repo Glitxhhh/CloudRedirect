@@ -26,11 +26,12 @@ using SerializeBodyFn = const uint8_t* (*)(void* bodyObj, size_t* outLen);
 bool Resolve(uintptr_t steamclientBase, size_t steamclientSize, SerializeBodyFn serialize);
 bool Ready();
 
-// Called from the CCMInterface::Send observer for every outbound message. Detects
+// Called from the CCMInterface::Send hook for every outbound message. Detects
 // EMsg 818, reads its appid + jobid from the message header, and (for a namespace
-// app) queues a 819 response. Returns immediately; the response is routed on the
-// next network-thread drain. msgObj = the CProtoBufMsg being sent.
-void ObserveOutbound(uint32_t emsg, void* msgObj, void* cmInterface);
+// app) queues a 819 response. Returns 1 if the send should be BLOCKED (we are
+// the server), 0 to let it pass through. The response is routed on the next
+// network-thread drain. msgObj = the CProtoBufMsg being sent.
+int ObserveOutbound(uint32_t emsg, void* msgObj, void* cmInterface);
 
 // Route any queued 819 responses. MUST run on Steam's network thread (valid
 // coroutine TLS), same constraint as the live playtime drain.

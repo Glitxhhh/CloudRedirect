@@ -580,13 +580,18 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     uint64_t appBuildIdHwm = 0;
     CloudStorage::CloudAppState fetchedState; // retained for quota caching
     bool haveFetchedState = false;
+    // Timeout/FetchFailed/ParseFailed: cloud state is UNKNOWN, not empty. Must never
+    // present authoritative-empty (is_only_delta=0, CN=0) -- Steam reads that as
+    // "cloud empty" and uploads local over a newer cloud save (the rollback bug).
+    bool inconclusiveFetch = false;
 
     if (CloudStorage::IsCloudActive()) {
         SetRpcCrashContext("GetChangelist:fetch-cloud", "Cloud.GetAppFileChangelist#1", appId);
         // Bounded -- runs on Steam's main-loop thread, where a slow download used to
         // stall BMainLoop past the 15s watchdog. On timeout we fall through to the
         // local-manifest fallback and the background fetch warms the cache.
-        static constexpr int kChangelistFetchDeadlineMs = 5000;
+        // ~11s observed for a Drive cold fetch; stay under the 15s BMainLoop watchdog.
+        static constexpr int kChangelistFetchDeadlineMs = 12000;
         auto stateResult = CloudStorage::FetchCloudStateBounded(
             accountId, appId, kChangelistFetchDeadlineMs);
         if (stateResult.status == CloudStorage::StateFetchStatus::Ok) {
@@ -619,9 +624,11 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             LOG("[NS-CL] GetAppFileChangelist app=%u: no cloud state (new app), using local",
                 appId);
         } else if (stateResult.status == CloudStorage::StateFetchStatus::Timeout) {
+            inconclusiveFetch = true;
             LOG("[NS-CL] GetAppFileChangelist app=%u: cloud fetch timed out, using local "
                 "(avoids BMainLoop stall; cache warms in background)", appId);
         } else {
+            inconclusiveFetch = true;
             LOG("[NS-CL] GetAppFileChangelist app=%u: cloud state fetch failed (status=%d), using local",
                 appId, static_cast<int>(stateResult.status));
         }
@@ -659,12 +666,42 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     uint64_t serverChangeNumber = 0;  // Initialize to prevent UB in edge cases
     bool responseIsDelta = true;
 
-    if (haveCloudManifest && cloudManifest.empty() && cloudCN == 0) {
+    if (inconclusiveFetch) {
+        // Cloud state unknown: serve local files as a pure delta (is_only_delta=1)
+        // so Steam never reconcile-deletes or treats it as cloud-empty. Don't rewind CN.
+        SetRpcCrashContext("GetChangelist:inconclusive-fetch", "Cloud.GetAppFileChangelist#1", appId);
+        files = LocalStorage::GetFileList(accountId, appId);
+        serverChangeNumber = clientChangeNumber > cloudCN ? clientChangeNumber : cloudCN;
+        responseIsDelta = true;
+        files.erase(std::remove_if(files.begin(), files.end(),
+            [](const LocalStorage::FileEntry& fe) {
+                return IsReservedBlobFilename(fe.filename);
+            }), files.end());
+        LOG("[NS-CL] GetAppFileChangelist app=%u: INCONCLUSIVE cloud fetch -- serving %zu "
+            "local files as delta at CN=%llu (clientCN=%llu); will NOT signal cloud-empty",
+            appId, files.size(), serverChangeNumber, clientChangeNumber);
+    } else if (haveCloudManifest && cloudManifest.empty() && cloudCN == 0) {
         // New app at CN=0 -- return empty authoritative inventory
         serverChangeNumber = cloudCN;
         responseIsDelta = false;
         LOG("[NS-CL] GetAppFileChangelist app=%u: cloud manifest is empty at CN=%llu, returning empty authoritative inventory",
             appId, cloudCN);
+    } else if (haveCloudManifest && !cloudManifest.empty() &&
+               clientChangeNumber != 0 && cloudCN < clientChangeNumber) {
+        // cloudCN < clientCN means the cloud regressed; serve local as a delta so Steam
+        // re-uploads instead of pulling a stale save over a newer one.
+        SetRpcCrashContext("GetChangelist:cloud-rewind-heal", "Cloud.GetAppFileChangelist#1", appId);
+        LOG("[NS-CL] GetAppFileChangelist app=%u: HEAL cloudCN=%llu < clientCN=%llu "
+            "(cloud regressed); serving local as authoritative so Steam re-uploads",
+            appId, cloudCN, clientChangeNumber);
+
+        files = LocalStorage::GetFileList(accountId, appId);
+        serverChangeNumber = clientChangeNumber;  // do not rewind the client's CN
+        responseIsDelta = true;                   // delta: never reconcile-delete here
+        files.erase(std::remove_if(files.begin(), files.end(),
+            [](const LocalStorage::FileEntry& fe) {
+                return IsReservedBlobFilename(fe.filename);
+            }), files.end());
     } else if (haveCloudManifest && !cloudManifest.empty()) {
         SetRpcCrashContext("GetChangelist:manifest-delta", "Cloud.GetAppFileChangelist#1", appId);
         // Steam-faithful delta: compute diff between clientCN snapshot and current manifest.
@@ -1307,8 +1344,18 @@ RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody
         if (bbMs > 500)
             LOG("[NS] BeginBatch app=%u: FetchCloudStateForServe took %lldms "
                 "(on Steam's thread)", appId, (long long)bbMs);
-        if (cloud.status == CloudStorage::StateFetchStatus::Ok)
+        if (cloud.status == CloudStorage::StateFetchStatus::Ok) {
             cloudCN = cloud.state.cn;
+        } else if (cloud.status != CloudStorage::StateFetchStatus::NotFound) {
+            // Cloud CN UNKNOWN (Timeout/FetchFailed/ParseFailed). Native never assigns
+            // an upload CN client-side -- the server is sole CN authority. Assigning
+            // localCN+1 here can land BELOW the true cloud CN and roll the cloud back.
+            // Fail the batch; Steam retries once the fetch resolves (cache warms async).
+            LOG("[NS] BeginBatch app=%u: cloud CN unverifiable (status=%d) -- failing batch "
+                "to avoid regressive CN; Steam will retry", appId,
+                static_cast<int>(cloud.status));
+            return RpcResult(PB::Writer(), kEResultFail);
+        }
     }
     uint64_t assignedCN = (std::max)(localCN, cloudCN) + 1;
     uint64_t appBuildId = 0;
@@ -1773,8 +1820,13 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
             PersistFileTokens(accountId, appId);
         }
     }
-    std::vector<std::string> uploads(batch.uploads.begin(), batch.uploads.end());
-    std::vector<std::string> deletes(batch.deletes.begin(), batch.deletes.end());
+    // Heap-allocate uploads/deletes: the promote thread runs concurrently while
+    // PumpUntil yields the coroutine. A yield can invalidate the coroutine stack,
+    // so any data the promote thread touches must live on the heap.
+    auto uploads = std::make_shared<std::vector<std::string>>(
+        batch.uploads.begin(), batch.uploads.end());
+    auto deletes = std::make_shared<std::vector<std::string>>(
+        batch.deletes.begin(), batch.deletes.end());
 
     // Native runs upload+complete as a yielding job; doing it synchronously here
     // blocked BMainLoop past the 15s watchdog on large saves. Detach it instead.
@@ -1810,26 +1862,28 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
     // only after the promote completes, keeping the CN advance below strictly after
     // durability; no CR mutex is held across the pump, so a re-entry can't deadlock.
     auto tPromote = std::chrono::steady_clock::now();
-    std::atomic<bool> promoteDone{false};
-    bool promoteOk = false;
+    // Heap-allocate sync state: if Steam's job watchdog destroys the coroutine
+    // during a yield, anything on the fiber stack becomes UAF.
+    auto promoteDone = std::make_shared<std::atomic<bool>>(false);
+    auto promoteOk = std::make_shared<bool>(false);
     std::thread promoteThread(
-        [&accountId, &appId, &workerBatchId, &uploads, &deletes,
-         &promoteOk, &promoteDone]() {
-            promoteOk = CloudStorage::PromoteStagedBatchForCommit(
-                accountId, appId, workerBatchId, uploads, deletes);
-            promoteDone.store(true, std::memory_order_release);
+        [accountId, appId, workerBatchId, uploads, deletes,
+         promoteOk, promoteDone]() {
+            *promoteOk = CloudStorage::PromoteStagedBatchForCommit(
+                accountId, appId, workerBatchId, *uploads, *deletes);
+            promoteDone->store(true, std::memory_order_release);
         });
     // Cooperative wait: pumps BMainLoop via the guarded job-coroutine yield until the
     // promote thread signals completion. Degrades to a plain spin off Steam.
-    CoopYield::PumpUntil([&promoteDone]() {
-        return promoteDone.load(std::memory_order_acquire);
+    CoopYield::PumpUntil([promoteDone]() {
+        return promoteDone->load(std::memory_order_acquire);
     });
     promoteThread.join();
     auto promoteMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - tPromote).count();
     LOG("[NS] CompleteBatch app=%u: promote done in %lldms (ok=%d)",
-        appId, (long long)promoteMs, promoteOk ? 1 : 0);
-    if (!promoteOk) {
+        appId, (long long)promoteMs, *promoteOk ? 1 : 0);
+    if (!*promoteOk) {
         LOG("[NS] CompleteBatch app=%u: staged promotion failed; "
             "leaving CN unchanged (Steam re-uploads next sync)", appId);
         PendingOpsJournal::RecordUploadBatchInterrupted(accountId, appId);
@@ -1847,9 +1901,9 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
         auto syncMtx = CloudStorage::AcquireAppSyncMutex(accountId, appId);
         auto lock = CoopYield::LockCooperatively(*syncMtx);
         auto localManifest = CloudStorage::LoadLocalManifest(accountId, appId);
-        for (const auto& filename : deletes)
+        for (const auto& filename : *deletes)
             localManifest.erase(filename);
-        for (const auto& filename : uploads) {
+        for (const auto& filename : *uploads) {
             if (IsReservedBlobFilename(filename)) continue;
             CloudStorage::ManifestEntry me;
             auto metaIt = uploadMeta.find(filename);
@@ -1879,8 +1933,8 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
         std::unordered_map<std::string, CloudIntercept::UploadFileMeta>>(uploadMeta);
     auto filePlatformsCopy = std::make_shared<
         std::unordered_map<std::string, uint32_t>>(filePlatforms);
-    auto uploadsCopy = std::make_shared<std::vector<std::string>>(uploads);
-    auto deletesCopy = std::make_shared<std::vector<std::string>>(deletes);
+    auto uploadsCopy = uploads;
+    auto deletesCopy = deletes;
 
     std::promise<void> publishPromise;
     CloudStorage::SetPendingPublish(accountId, appId, publishPromise.get_future().share());
@@ -1893,19 +1947,6 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
             publishPromise.set_value();
             return;
         }
-
-        // Files this batch uploaded are provider-confirmed durable (the promote's
-        // UploadBatch returned true, i.e. a 2xx per file). Pass them to the publish so
-        // it can skip the slow blob re-listing for them -- native trusts the same
-        // upload result and never re-lists. Deletes/reserved names are excluded; only
-        // carried-forward files (not in this set) still need a durability check.
-        std::unordered_set<std::string> confirmedDurable;
-        confirmedDurable.reserve(uploadsCopy->size());
-        for (const auto& filename : *uploadsCopy) {
-            if (IsReservedBlobFilename(filename)) continue;
-            confirmedDurable.insert(filename);
-        }
-        for (const auto& filename : *deletesCopy) confirmedDurable.erase(filename);
 
         bool publishSucceeded = false;
         constexpr int kMaxAttempts = 4;
@@ -2019,7 +2060,7 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
             publishState.cn = publishCN;
             publishState.appBuildId = publishBuildId;
             if (CloudStorage::PublishCloudState(accountId, appId, publishState,
-                                                /*lockOnly=*/false, &confirmedDurable)) {
+                                                /*lockOnly=*/false)) {
                 LOG("[NS] CompleteBatch(pub): publish %d/%d succeeded for app %u at CN=%llu",
                     attempt, kMaxAttempts, appId, (unsigned long long)publishCN);
                 if (!evicted.empty()) {

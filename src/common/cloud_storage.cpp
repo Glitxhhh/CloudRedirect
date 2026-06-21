@@ -96,6 +96,47 @@ static bool IsBlobShaDurableThisSession(uint32_t accountId, uint32_t appId,
     return it != g_durableBlobs.end() && it->second.count(shaHex) > 0;
 }
 
+// 60s blob-listing cache: VerifyAndHealManifestForPublish and GarbageCollectBlobs
+// list the same blobs/ prefix back-to-back (~20s on GDrive). Invalidated on upload/delete.
+struct BlobListingCache {
+    std::vector<ICloudProvider::FileInfo> blobs;
+    std::chrono::steady_clock::time_point fetchedAt;
+    bool complete = false;
+};
+static std::mutex g_blobListingCacheMtx;
+static std::unordered_map<uint64_t, BlobListingCache> g_blobListingCache;
+static constexpr int kBlobListingCacheTtlSec = 60;
+
+static bool GetCachedBlobListing(uint32_t accountId, uint32_t appId,
+                                 std::vector<ICloudProvider::FileInfo>& out) {
+    uint64_t key = (static_cast<uint64_t>(accountId) << 32) | appId;
+    std::lock_guard<std::mutex> lk(g_blobListingCacheMtx);
+    auto it = g_blobListingCache.find(key);
+    if (it == g_blobListingCache.end()) return false;
+    auto age = std::chrono::steady_clock::now() - it->second.fetchedAt;
+    if (age > std::chrono::seconds(kBlobListingCacheTtlSec) || !it->second.complete) {
+        g_blobListingCache.erase(it);
+        return false;
+    }
+    out = it->second.blobs;
+    return true;
+}
+
+static void SetCachedBlobListing(uint32_t accountId, uint32_t appId,
+                                 const std::vector<ICloudProvider::FileInfo>& blobs,
+                                 bool complete) {
+    if (!complete) return;  // only cache complete listings
+    uint64_t key = (static_cast<uint64_t>(accountId) << 32) | appId;
+    std::lock_guard<std::mutex> lk(g_blobListingCacheMtx);
+    g_blobListingCache[key] = {blobs, std::chrono::steady_clock::now(), true};
+}
+
+static void InvalidateBlobListingCache(uint32_t accountId, uint32_t appId) {
+    uint64_t key = (static_cast<uint64_t>(accountId) << 32) | appId;
+    std::lock_guard<std::mutex> lk(g_blobListingCacheMtx);
+    g_blobListingCache.erase(key);
+}
+
 // Serializes token persistence (root_token.dat, file_tokens.dat) across
 // concurrent callers (rpc_handlers batch operations).
 // Per-(account,app) sync mutex registry (Steam-parity). Non-reentrant: SyncFromCloudInner-reachable callers go direct.
@@ -1539,8 +1580,7 @@ bool DeleteBlobStaged(uint32_t accountId, uint32_t appId,
 // (forget) rather than advertise a blob that 404s elsewhere. Returns false only
 // when the cloud listing is unavailable (can't tell durable from phantom).
 bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
-                                     CloudAppState& state,
-                                     const std::unordered_set<std::string>* confirmedDurable) {
+                                     CloudAppState& state) {
     if (state.files.empty()) return true;
 
     InflightSyncScope guard;
@@ -1552,15 +1592,10 @@ bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
     if (appId == CloudIntercept::kAccountScopeAppId) return true;
 
     // Skip blob re-listing for a file whose content hash is in the session durable
-    // cache. Sha-keyed only: the cache holds the shas the promote actually uploaded
-    // (RecordDurableBlobShas, populated before this runs). Filename is not trusted --
-    // fe.sha may differ from the uploaded sha, which could skip a stale CAS path. If
-    // every file qualifies the ~20s GDrive walk is skipped; a mixed state still lists
-    // the unconfirmed remainder. confirmedDurable is kept for ABI but no longer read.
-    auto durableWithoutListing = [&](const std::string& filename,
-                                     const FileEntry& fe) -> bool {
-        (void)filename;
-        (void)confirmedDurable;
+    // cache. The cache holds shas the promote actually uploaded (RecordDurableBlobShas,
+    // populated before this runs). If every file qualifies the ~20s GDrive walk is
+    // skipped entirely; a mixed state still lists the unconfirmed remainder.
+    auto durableWithoutListing = [&](const FileEntry& fe) -> bool {
         std::string shaHex = fe.sha.empty() ? std::string() : ShaToHex(fe.sha);
         return !shaHex.empty() && IsBlobShaDurableThisSession(accountId, appId, shaHex);
     };
@@ -1568,7 +1603,7 @@ bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
     {
         bool allConfirmed = true;
         for (const auto& [filename, fe] : state.files) {
-            if (!durableWithoutListing(filename, fe)) { allConfirmed = false; break; }
+            if (!durableWithoutListing(fe)) { allConfirmed = false; break; }
         }
         if (allConfirmed) {
             LOG("[CloudStorage] VerifyManifest app %u: all %zu file(s) confirmed durable "
@@ -1581,11 +1616,18 @@ bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
     std::string blobPrefix = std::to_string(accountId) + "/" +
                              std::to_string(appId) + "/blobs/";
     std::vector<ICloudProvider::FileInfo> remoteBlobs;
-    bool complete = false;
-    if (!g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
-        LOG("[CloudStorage] VerifyManifest app %u: blob listing unavailable; not publishing",
-            appId);
-        return false;
+    bool fromCache = GetCachedBlobListing(accountId, appId, remoteBlobs);
+    if (!fromCache) {
+        bool complete = false;
+        if (!g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
+            LOG("[CloudStorage] VerifyManifest app %u: blob listing unavailable; not publishing",
+                appId);
+            return false;
+        }
+        SetCachedBlobListing(accountId, appId, remoteBlobs, complete);
+    } else {
+        LOG("[CloudStorage] VerifyManifest app %u: reusing cached blob listing (%zu entries)",
+            appId, remoteBlobs.size());
     }
 
     // Build the set of SHAs and legacy paths actually present on the provider.
@@ -1613,10 +1655,8 @@ bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
         const std::string& filename = it->first;
         const FileEntry& fe = it->second;
 
-        // Sha confirmed durable this session: durable by definition, no need to consult
-        // the listing (it may even race a just-completed upload's eventual-consistency
-        // window). Trust the upload 2xx, exactly as native trusts EResult.
-        if (durableWithoutListing(filename, fe)) { ++it; continue; }
+        // Sha confirmed durable this session: trust the upload 2xx.
+        if (durableWithoutListing(fe)) { ++it; continue; }
 
         std::string shaHex = fe.sha.empty() ? std::string() : ShaToHex(fe.sha);
         bool present = (!shaHex.empty() && cloudShas.count(shaHex) > 0) ||
@@ -1651,6 +1691,7 @@ bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
 
     if (!healed.empty() || !dropped.empty()) {
         InvalidateBlobIndex(accountId, appId);
+        if (!healed.empty()) InvalidateBlobListingCache(accountId, appId);
         LOG("[CloudStorage] VerifyManifest app %u: healed %zu, dropped %zu phantom file(s)",
             appId, healed.size(), dropped.size());
     }
@@ -1737,6 +1778,7 @@ bool PromoteStagedBatchForCommit(uint32_t accountId, uint32_t appId,
     LOG("[CloudStorage] PromoteStagedBatch app %u batch %llu: promoted %zu upload(s), %zu delete(s)",
         appId, (unsigned long long)batchId, uploads.size(), deletes.size());
     InvalidateBlobIndex(accountId, appId);
+    InvalidateBlobListingCache(accountId, appId);
     return true;
 }
 
@@ -1912,10 +1954,16 @@ int GarbageCollectBlobs(uint32_t accountId, uint32_t appId) {
     std::string blobPrefix = std::to_string(accountId) + "/" +
                              std::to_string(appId) + "/blobs/";
     std::vector<ICloudProvider::FileInfo> remoteBlobs;
-    bool complete = false;
-    if (!g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
-        LOG("[GC] app=%u: listing incomplete or failed, refusing GC", appId);
-        return -1;
+    bool fromCache = GetCachedBlobListing(accountId, appId, remoteBlobs);
+    if (!fromCache) {
+        bool complete = false;
+        if (!g_provider->ListChecked(blobPrefix, remoteBlobs, &complete) || !complete) {
+            LOG("[GC] app=%u: listing incomplete or failed, refusing GC", appId);
+            return -1;
+        }
+        SetCachedBlobListing(accountId, appId, remoteBlobs, complete);
+    } else {
+        LOG("[GC] app=%u: reusing cached blob listing (%zu entries)", appId, remoteBlobs.size());
     }
 
     if (remoteBlobs.empty()) {
@@ -2087,6 +2135,7 @@ int GarbageCollectBlobs(uint32_t accountId, uint32_t appId) {
 
     LOG("[GC] app=%u: deleted %d/%zu orphaned blobs", appId, deleted, orphans.size());
     InvalidateBlobIndex(accountId, appId);
+    InvalidateBlobListingCache(accountId, appId);
     return deleted + promoted;
 }
 
@@ -2592,104 +2641,142 @@ static bool SyncFromCloudInner(uint32_t accountId, uint32_t appId, bool isSweep)
             }
         }
 
-        auto blobStart = std::chrono::steady_clock::now();
-        for (auto& item : downloadItems) {
-            // Check timeout
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - blobStart).count();
-            if (elapsed >= BLOB_SYNC_TIMEOUT_SEC) {
-                int remaining = (int)downloadItems.size() - downloaded - skipped;
-                LOG("[CloudStorage] SyncFromCloud app %u: blob download TIMEOUT after %llds, "
-                    "%d downloaded, %d skipped, ~%d remaining",
-                    appId, (long long)elapsed, downloaded, skipped, remaining);
-                timedOut = true;
-                break;
-            }
-            if (isSweep && g_foregroundSyncCount.load(std::memory_order_seq_cst) > 0) {
-                int remaining = (int)downloadItems.size() - downloaded - skipped;
-                LOG("[CloudStorage] SyncFromCloud app %u: sweep yielding blob loop to foreground sync (downloaded=%d skipped=%d remaining=%d)",
-                    appId, downloaded, skipped, remaining);
-                timedOut = true;
-                break;
-            }
+        // Parallel download: 8 workers (mirrors RestoreBlobs bootstrap concurrency).
+        // Download + local-write are both thread-safe (per-request HTTP handles;
+        // WriteFileNoIncrement holds its own mutex).
+        static constexpr size_t kMaxDownloadWorkers = 8;
 
+        auto blobStart = std::chrono::steady_clock::now();
+        std::atomic<size_t> nextIdx{0};
+        std::atomic<int> aDownloaded{0}, aSkipped{0}, aFailed{0};
+        std::atomic<bool> aStopped{false};  // timeout or sweep-yield
+        std::mutex stagedMtx;
+
+        // Per-item download logic (runs on worker threads).
+        auto downloadOne = [&](const DownloadItem& item) {
             std::string localBlobFile = LocalBlobPath(accountId, appId, item.filename);
             std::error_code existsEc;
             bool localExists = std::filesystem::exists(FileUtil::Utf8ToPath(localBlobFile), existsEc);
             if (existsEc) localExists = false;
             if (localExists && !cloudHadNewerCN) {
-                skipped++;
-                continue; // already cached
+                aSkipped.fetch_add(1, std::memory_order_relaxed);
+                return;
             }
 
             LOG("[CloudStorage] SyncFromCloud app %u: downloading blob %s...", appId, item.filename.c_str());
             std::vector<uint8_t> data;
-            if (g_provider->Download(item.cloudPath, data)) {
-                if (cloudHadNewerCN) {
-                    stagedNewerBlobs.push_back({ item.filename, std::move(data) });
-                    downloaded++;
-                    continue;
-                }
+            bool ok = g_provider->Download(item.cloudPath, data);
 
-                const uint8_t* writeData = data.empty() ? nullptr : data.data();
-                if (LocalStorage::WriteFileNoIncrement(accountId, appId, item.filename,
-                                                       writeData, data.size())) {
-                    downloaded++;
-                    LOG("[CloudStorage] SyncFromCloud app %u: blob %s downloaded (%zu bytes)",
-                        appId, item.filename.c_str(), data.size());
-                } else {
-                    failed++;
-                    LOG("[CloudStorage] SyncFromCloud app %u: failed to write blob %s",
-                        appId, item.filename.c_str());
-                    continue;
-                }
-            } else if (!syncManifest.empty()) {
-                // Canonical failed -- cascade: legacy CAS, then pre-CAS filename.
+            // Fallback cascade (CAS manifest only).
+            if (!ok && !syncManifest.empty()) {
                 auto mit = syncManifest.find(item.filename);
                 std::string fallbackPath;
-                if (mit != syncManifest.end() && !mit->second.sha.empty()) {
-                    fallbackPath = CloudBlobPathBySHA(accountId, appId,
-                                                     ShaToHex(mit->second.sha));
-                }
-                bool fellBack = false;
+                if (mit != syncManifest.end() && !mit->second.sha.empty())
+                    fallbackPath = CloudBlobPathBySHA(accountId, appId, ShaToHex(mit->second.sha));
                 if (!fallbackPath.empty() && g_provider->Download(fallbackPath, data)) {
-                    fellBack = true;
+                    ok = true;
                     LOG("[CloudStorage] SyncFromCloud app %u: blob %s downloaded from legacy CAS path (%zu bytes)",
                         appId, item.filename.c_str(), data.size());
                 } else {
                     std::string legacyPath = CloudBlobPath(accountId, appId, item.filename);
                     if (g_provider->Download(legacyPath, data)) {
-                        fellBack = true;
+                        ok = true;
                         LOG("[CloudStorage] SyncFromCloud app %u: blob %s downloaded from legacy filename path (%zu bytes)",
                             appId, item.filename.c_str(), data.size());
                     }
                 }
-                if (fellBack) {
-                    if (cloudHadNewerCN) {
-                        stagedNewerBlobs.push_back({ item.filename, std::move(data) });
-                        downloaded++;
-                        continue;
-                    }
-                    const uint8_t* writeData = data.empty() ? nullptr : data.data();
-                    if (LocalStorage::WriteFileNoIncrement(accountId, appId, item.filename,
-                                                           writeData, data.size())) {
-                        downloaded++;
-                    } else {
-                        failed++;
-                        LOG("[CloudStorage] SyncFromCloud app %u: failed to write blob %s (legacy fallback)",
-                            appId, item.filename.c_str());
-                    }
-                } else {
-                    failed++;
-                    LOG("[CloudStorage] SyncFromCloud app %u: FAILED to download blob %s",
-                        appId, item.filename.c_str());
-                }
-            } else {
-                failed++;
+            }
+
+            if (!ok) {
+                aFailed.fetch_add(1, std::memory_order_relaxed);
                 LOG("[CloudStorage] SyncFromCloud app %u: FAILED to download blob %s",
                     appId, item.filename.c_str());
+                return;
             }
+
+            if (cloudHadNewerCN) {
+                std::lock_guard<std::mutex> lk(stagedMtx);
+                stagedNewerBlobs.push_back({ item.filename, std::move(data) });
+                aDownloaded.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                const uint8_t* writeData = data.empty() ? nullptr : data.data();
+                if (LocalStorage::WriteFileNoIncrement(accountId, appId, item.filename,
+                                                       writeData, data.size())) {
+                    aDownloaded.fetch_add(1, std::memory_order_relaxed);
+                    LOG("[CloudStorage] SyncFromCloud app %u: blob %s downloaded (%zu bytes)",
+                        appId, item.filename.c_str(), data.size());
+                } else {
+                    aFailed.fetch_add(1, std::memory_order_relaxed);
+                    LOG("[CloudStorage] SyncFromCloud app %u: failed to write blob %s",
+                        appId, item.filename.c_str());
+                }
+            }
+        };
+
+        // Worker: claim items by index until exhausted, stopped, or failed.
+        auto worker = [&]() {
+            for (;;) {
+                if (aStopped.load(std::memory_order_relaxed)) return;
+                size_t i = nextIdx.fetch_add(1, std::memory_order_relaxed);
+                if (i >= downloadItems.size()) return;
+                try {
+                    downloadOne(downloadItems[i]);
+                } catch (const std::exception& e) {
+                    aFailed.fetch_add(1, std::memory_order_relaxed);
+                    LOG("[CloudStorage] SyncFromCloud app %u: download worker threw on %s: %s",
+                        appId, downloadItems[i].filename.c_str(), e.what());
+                } catch (...) {
+                    aFailed.fetch_add(1, std::memory_order_relaxed);
+                    LOG("[CloudStorage] SyncFromCloud app %u: download worker threw (unknown) on %s",
+                        appId, downloadItems[i].filename.c_str());
+                }
+            }
+        };
+
+        size_t workerCount = (std::min)(kMaxDownloadWorkers, downloadItems.size());
+        if (workerCount < 1) workerCount = 1;
+
+        if (downloadItems.size() <= 1) {
+            // Single item or empty: run inline, no thread overhead.
+            if (!downloadItems.empty()) downloadOne(downloadItems[0]);
+        } else {
+            // Spawn workers; monitor timeout/sweep-yield on main thread.
+            std::vector<std::thread> pool;
+            pool.reserve(workerCount);
+            for (size_t t = 0; t < workerCount; ++t) pool.emplace_back(worker);
+
+            // Poll for timeout/sweep-yield while workers run.
+            while (nextIdx.load(std::memory_order_relaxed) < downloadItems.size() &&
+                   !aStopped.load(std::memory_order_relaxed)) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - blobStart).count();
+                if (elapsed >= BLOB_SYNC_TIMEOUT_SEC) {
+                    int done = aDownloaded.load() + aSkipped.load();
+                    int remaining = (int)downloadItems.size() - done;
+                    LOG("[CloudStorage] SyncFromCloud app %u: blob download TIMEOUT after %llds, "
+                        "%d downloaded, %d skipped, ~%d remaining",
+                        appId, (long long)elapsed, aDownloaded.load(), aSkipped.load(), remaining);
+                    aStopped.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                if (isSweep && g_foregroundSyncCount.load(std::memory_order_seq_cst) > 0) {
+                    int done = aDownloaded.load() + aSkipped.load();
+                    int remaining = (int)downloadItems.size() - done;
+                    LOG("[CloudStorage] SyncFromCloud app %u: sweep yielding blob loop to foreground sync (downloaded=%d skipped=%d remaining=%d)",
+                        appId, aDownloaded.load(), aSkipped.load(), remaining);
+                    aStopped.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            for (auto& th : pool) th.join();
         }
+
+        downloaded = aDownloaded.load();
+        skipped = aSkipped.load();
+        failed = aFailed.load();
+        timedOut = aStopped.load();
 
         if (cloudHadNewerCN && failed == 0 && !timedOut) {
             struct PromotedBlob {

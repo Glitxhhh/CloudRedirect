@@ -661,6 +661,13 @@ ManifestDelta ComputeManifestDelta(uint32_t accountId, uint32_t appId,
     ManifestDelta delta;
     delta.serverCN = serverCN;
 
+    // serverCN < clientCN means the cloud lost progress; local is authoritative, so
+    // hold the client CN rather than diff a stale server manifest (would regress saves).
+    if (serverCN < clientCN) {
+        delta.serverCN = clientCN;  // hold the client's CN; do not regress
+        return delta;               // empty files: nothing newer to pull
+    }
+
     bool snapshotExists = ManifestSnapshotExists(accountId, appId, clientCN);
     Manifest baseline = snapshotExists
         ? LoadManifestSnapshotInternal(accountId, appId, clientCN)

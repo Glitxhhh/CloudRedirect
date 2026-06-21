@@ -71,7 +71,7 @@ void Init(const char* path) {
         localtime_s(&lt, &t);
         char buf[128];
         int n = snprintf(buf, sizeof(buf),
-                         "\n=== CloudRedirect loaded at %04d-%02d-%02d %02d:%02d:%02d ===\n",
+                         "\n=== CloudRedirect loaded at %04d-%02d-%02d %02d:%02d:%02d [BUILD:" CR_RELEASE_VERSION "] ===\n",
                          lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
                          lt.tm_hour, lt.tm_min, lt.tm_sec);
         if (n > 0) WriteRecord(buf, (size_t)n);

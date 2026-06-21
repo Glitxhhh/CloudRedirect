@@ -109,6 +109,11 @@ public sealed class Steam760Cloud : IDisposable
                 if (t.Length == 0) continue;
                 if (t.StartsWith("Setting breakpad", StringComparison.OrdinalIgnoreCase)) continue;
                 if (t.StartsWith("Steam_SetMinidump", StringComparison.OrdinalIgnoreCase)) continue;
+                // The tool prefixes its own messages with "Error:"; strip it so callers
+                // that add their own "Error: " prefix don't produce "Error: Error: ...".
+                if (t.StartsWith("Error:", StringComparison.OrdinalIgnoreCase))
+                    t = t.Substring("Error:".Length).TrimStart();
+                if (t.Length == 0) continue;
                 meaningful.Add(t);
             }
             if (meaningful.Count > 0)

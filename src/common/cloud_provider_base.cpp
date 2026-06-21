@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <random>
 
 using HttpUtil::HttpResp;
 
@@ -16,6 +17,10 @@ using HttpUtil::HttpResp;
 // UploadBatch for throughput telemetry). Confirms the API throttle has
 // headroom before lowering it further.
 std::atomic<uint64_t> g_rateLimitHits{0};
+
+// In-flight upload byte cap (see header). Default 24 MB; overridden from
+// config.json "upload_inflight_mb" at DLL init.
+std::atomic<uint64_t> g_uploadInFlightCapBytes{24ull << 20};
 
 // ── ParsePath ──────────────────────────────────────────────────────────────
 
@@ -230,10 +235,21 @@ HttpResp CloudProviderBase::ApiGet(const std::string& path) {
 HttpResp CloudProviderBase::ApiRequest(const char* method, const std::string& path,
                                         const std::string& body,
                                         const std::string& contentType) {
+    // Exponential backoff with jitter: base 1s, factor 2x, up to 5 attempts.
+    // Retries on rate-limit (429 / 403+rateLimitExceeded) AND timeout (HTTP 0).
+    static constexpr int kMaxAttempts = 5;
+    static thread_local std::mt19937 rng{std::random_device{}()};
+
     HttpResp lastResp;
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        if (attempt > 0)
-            std::this_thread::sleep_for(std::chrono::seconds(attempt));
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (attempt > 0) {
+            int baseMs = 1000 * (1 << (attempt - 1)); // 1s, 2s, 4s, 8s
+            int jitter = std::uniform_int_distribution<int>(0, baseMs / 2)(rng);
+            int delayMs = baseMs + jitter;
+            LOG("%s Backoff %s %s: attempt %d, waiting %dms",
+                LogTag(), method, path.c_str(), attempt + 1, delayMs);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        }
         auto token = GetAccessToken();
         if (token.empty()) {
             LOG("%s ApiRequest: no access token for %s %s", LogTag(), method, path.c_str());
@@ -244,12 +260,16 @@ HttpResp CloudProviderBase::ApiRequest(const char* method, const std::string& pa
         if (!contentType.empty())
             hdrs.push_back("Content-Type: " + contentType);
         lastResp = Request(method, ApiHost(), path, body, hdrs);
-        if (!IsRateLimited(lastResp.status, lastResp.body)) return lastResp;
-        g_rateLimitHits.fetch_add(1, std::memory_order_relaxed);
-        LOG("%s Rate limited (%s attempt %d, HTTP %d), retrying",
-            LogTag(), method, attempt + 1, lastResp.status);
+        bool rateLimited = IsRateLimited(lastResp.status, lastResp.body);
+        bool timedOut = (lastResp.status == 0);
+        if (!rateLimited && !timedOut) return lastResp;
+        if (rateLimited)
+            g_rateLimitHits.fetch_add(1, std::memory_order_relaxed);
+        LOG("%s %s (%s attempt %d, HTTP %d), retrying",
+            LogTag(), rateLimited ? "Rate limited" : "Timeout",
+            method, attempt + 1, lastResp.status);
     }
-    LOG("%s Rate limit retries exhausted for %s %s", LogTag(), method, path.c_str());
+    LOG("%s Retries exhausted for %s %s (HTTP %d)", LogTag(), method, path.c_str(), lastResp.status);
     return lastResp;
 }
 

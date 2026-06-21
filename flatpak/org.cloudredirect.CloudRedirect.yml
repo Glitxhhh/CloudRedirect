@@ -44,8 +44,10 @@ modules:
     buildsystem: cmake-ninja
     no-debuginfo: true
     config-opts:
+      # Version is read from Version.props (copied into the sandbox below) by
+      # ui-linux/CMakeLists.txt. Do NOT hardcode CR_RELEASE_VERSION here -- it
+      # overrides Version.props and drifts out of sync.
       - -DCMAKE_BUILD_TYPE=Release
-      - -DCR_RELEASE_VERSION=2.2.0-TEST2
     sources:
       - type: dir
         path: ../ui-linux

@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <root>
   <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
     <xsd:element name="root" msdata:IsDataSet="true">
@@ -640,9 +640,6 @@ Si omites esto, las partidas se almacenarán localmente en tu carpeta de Steam.<
   <data name="CloudProvider_Cancel" xml:space="preserve">
     <value>Cancelar</value>
   </data>
-  <data name="CloudProvider_SaveConfiguration" xml:space="preserve">
-    <value>Guardar configuración</value>
-  </data>
 
   <data name="CloudProvider_NoConfigFound" xml:space="preserve">
     <value>No se encontró config.json -- usando valores predeterminados</value>
@@ -676,12 +673,6 @@ Si omites esto, las partidas se almacenarán localmente en tu carpeta de Steam.<
   </data>
   <data name="CloudProvider_MissingPathMessage" xml:space="preserve">
     <value>Establece primero una ruta para el archivo de token.</value>
-  </data>
-  <data name="CloudProvider_Saved" xml:space="preserve">
-    <value>Guardado</value>
-  </data>
-  <data name="CloudProvider_SavedMessage" xml:space="preserve">
-    <value>Configuración guardada correctamente.</value>
   </data>
   <data name="CloudProvider_FailedSaveConfig" xml:space="preserve">
     <value>Error al guardar la configuración: {0}</value>
@@ -979,7 +970,7 @@ La copia contiene: {1} archivo(s) ({2})
 Apps: {3}
 
 IMPORTANTE: Antes de restaurar, debes desactivar Steam Cloud para este juego:
-  Steam > clic derecho en el juego > Propiedades > General >
+  Steam &gt; clic derecho en el juego &gt; Propiedades &gt; General &gt;
   desmarca "Mantener partidas guardadas en Steam Cloud"
 
 Si Steam Cloud está activado, Steam puede sobrescribir los archivos restaurados.
@@ -1335,57 +1326,11 @@ Esto puede causar pérdida de datos en algunos casos.
   <data name="Disclaimer_WindowTitle" xml:space="preserve">
     <value>ADVERTENCIA</value>
   </data>
-  <data name="Disclaimer_BuildBanner" xml:space="preserve">
-    <value>CloudRedirect v2.0.3</value>
-  </data>
-  <data name="Disclaimer_ExperimentalBanner" xml:space="preserve">
-    <value>!  EXPERIMENTAL  -  RIESGO  DE  PÉRDIDA  DE  DATOS  !</value>
-  </data>
-  <data name="Disclaimer_WarningBold" xml:space="preserve">
-    <value>La redirección de partidas guardadas en la nube es EXPERIMENTAL y está en desarrollo activo.</value>
-  </data>
-  <data name="Disclaimer_ItMay" xml:space="preserve">
-    <value>Puede:</value>
-  </data>
-  <data name="Disclaimer_Corrupt" xml:space="preserve">
-    <value>CORROMPER</value>
-  </data>
-  <data name="Disclaimer_CorruptSuffix" xml:space="preserve">
-    <value> tus archivos de partidas guardadas</value>
-  </data>
-  <data name="Disclaimer_Lose" xml:space="preserve">
-    <value>PERDER</value>
-  </data>
-  <data name="Disclaimer_LoseSuffix" xml:space="preserve">
-    <value> tus datos de partidas guardadas</value>
-  </data>
-  <data name="Disclaimer_Overwrite" xml:space="preserve">
-    <value>SOBRESCRIBIR</value>
-  </data>
-  <data name="Disclaimer_OverwriteSuffix" xml:space="preserve">
-    <value> partidas buenas con malas</value>
-  </data>
-  <data name="Disclaimer_BackUpBold" xml:space="preserve">
-    <value>HAZ UNA COPIA DE SEGURIDAD DE TUS PARTIDAS antes de usar esto.</value>
-  </data>
-  <data name="Disclaimer_ExplanationText" xml:space="preserve">
-    <value>Si algo sale mal, tus PARTIDAS LOCALES podrían corromperse o perderse. Asegúrate de tener copias de seguridad de cualquier partida que te importe antes de continuar.</value>
-  </data>
-  <data name="Disclaimer_PleaseReadCarefully" xml:space="preserve">
-    <value>Por favor lee con cuidado...</value>
-  </data>
   <data name="Disclaimer_Cancel" xml:space="preserve">
     <value>Cancelar</value>
   </data>
   <data name="Disclaimer_AcceptButton" xml:space="preserve">
     <value>Entiendo los riesgos</value>
-  </data>
-
-  <data name="Disclaimer_CountdownFormat" xml:space="preserve">
-    <value>Por favor lee con cuidado... ({0}s)</value>
-  </data>
-  <data name="Disclaimer_Warned" xml:space="preserve">
-    <value>Has sido advertido.</value>
   </data>
 
   <data name="Dialog_OK" xml:space="preserve">
@@ -1550,6 +1495,24 @@ Esto puede causar pérdida de datos en algunos casos.
   <data name="Settings_SyncPlaytimeHint" xml:space="preserve">
     <value>Subir y fusionar los datos de tiempo de juego de las apps lua entre PCs.</value>
   </data>
+  <data name="CloudProvider_UploadInFlight" xml:space="preserve">
+    <value>Tamaño de subida simultánea</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightHint" xml:space="preserve">
+    <value>Controla los megabytes de archivos que se suben a la vez. Aumentarlo NO acelera las cargas, pero puede hacer que varias partidas grandes fallen al subirse. No se recomienda cambiarlo.</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightValue" xml:space="preserve">
+    <value>{0} MB</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightConservative" xml:space="preserve">
+    <value>Seguro (24)</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightBalanced" xml:space="preserve">
+    <value>Equilibrado (44)</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightAggressive" xml:space="preserve">
+    <value>Agresivo (64)</value>
+  </data>
   <data name="Settings_SyncLuas" xml:space="preserve">
     <value>Sincronizar archivos lua</value>
   </data>
@@ -1631,4 +1594,160 @@ Esto puede causar pérdida de datos en algunos casos.
     <value>Actualizar ahora</value>
   </data>
 
+  <data name="Cleanup_OstBanner_Description" xml:space="preserve">
+    <value>OpenSteamTool no enruta los guardados en la nube a través de la app 760. Esta página sirve para limpiar archivos dejados por una instalación previa de SteamTools.</value>
+  </data>
+  <data name="Cleanup_OstBanner_Title" xml:space="preserve">
+    <value>OpenSteamTool detectado</value>
+  </data>
+  <data name="Disclaimer_ChoiceBackup" xml:space="preserve">
+    <value>Si tu mayor miedo es reinstalar Windows sin copia de seguridad, un fallo de hardware o un juego que corrompe el guardado, Cloud Redirect puede ayudarte.</value>
+  </data>
+  <data name="Disclaimer_ChoiceHeading" xml:space="preserve">
+    <value>Te toca decidir.</value>
+  </data>
+  <data name="Disclaimer_ChoiceIntegrity" xml:space="preserve">
+    <value>Si lo que más te preocupa es la integridad de tus guardados locales, quizá esta no sea la herramienta para ti.</value>
+  </data>
+  <data name="Disclaimer_ChoiceMultiPC" xml:space="preserve">
+    <value>Si quieres jugar a un juego en dos o más PC, Cloud Redirect es la forma más fiable de hacerlo.</value>
+  </data>
+  <data name="Disclaimer_Closing" xml:space="preserve">
+    <value>Tú decides. Sin juicios.</value>
+  </data>
+  <data name="Disclaimer_Heading" xml:space="preserve">
+    <value>La vida son decisiones.</value>
+  </data>
+  <data name="Disclaimer_HowItWorks" xml:space="preserve">
+    <value>Cloud Redirect redirige las operaciones de Steam Cloud al proveedor que elijas. Con Google Drive, además, puedes acceder al historial de versiones y recuperar guardados antiguos.</value>
+  </data>
+  <data name="Disclaimer_Intro" xml:space="preserve">
+    <value>Antes aquí había una pantalla intimidante. Ya no está.</value>
+  </data>
+  <data name="Disclaimer_TrackRecord" xml:space="preserve">
+    <value>En la práctica, el riesgo es muy bajo. En toda la historia del proyecto solo se han reportado un par de incidentes de pérdida de datos, casi todos recuperables.</value>
+  </data>
+  <data name="Nav_Stats" xml:space="preserve">
+    <value>Logros y tiempo de juego</value>
+  </data>
+  <data name="Settings_Experimental" xml:space="preserve">
+    <value>Funciones experimentales</value>
+  </data>
+  <data name="Settings_ExperimentalHint" xml:space="preserve">
+    <value>PLACEHOLDER LOREM IPSUM</value>
+  </data>
+  <data name="Settings_Extra" xml:space="preserve">
+    <value>Calidad de vida</value>
+  </data>
+  <data name="Settings_ExtraHint" xml:space="preserve">
+    <value>Extras opcionales que no forman parte de la sincronización en la nube.</value>
+  </data>
+  <data name="Settings_GetAchievementData" xml:space="preserve">
+    <value>Hacer que los logros funcionen</value>
+  </data>
+  <data name="Settings_GetAchievementDataHint" xml:space="preserve">
+    <value>Obtiene datos de logros de Steam; hace que aparezcan logros en juegos para los que ST no consigue datos por sí mismo.</value>
+  </data>
+  <data name="Settings_ModeCloudRedirect" xml:space="preserve">
+    <value>Cloud Redirect</value>
+  </data>
+  <data name="Settings_ModeStFixer" xml:space="preserve">
+    <value>ST Fixer</value>
+  </data>
+  <data name="Settings_Parental" xml:space="preserve">
+    <value>Steam Familia</value>
+  </data>
+  <data name="Settings_ParentalBypassPlaytime" xml:space="preserve">
+    <value>Desactivar restricciones familiares</value>
+  </data>
+  <data name="Settings_ParentalBypassPlaytimeHint" xml:space="preserve">
+    <value>No se aplica ninguna restricción familiar del lado del cliente.</value>
+  </data>
+  <data name="Settings_ParentalHint" xml:space="preserve">
+    <value>Desactivar las restricciones de Steam Familia</value>
+  </data>
+  <data name="Settings_ParentalIgnorePlaytime" xml:space="preserve">
+    <value>Ignorar restricciones de tiempo de juego</value>
+  </data>
+  <data name="Settings_ParentalIgnorePlaytimeHint" xml:space="preserve">
+    <value>Desactiva las restricciones de tiempo de juego. Informa del tiempo hasta el límite establecido, pero no más allá.</value>
+  </data>
+  <data name="Settings_ShowNonSteamGame" xml:space="preserve">
+    <value>Mostrar juego Lua en el estado</value>
+  </data>
+  <data name="Settings_ShowNonSteamGameHint" xml:space="preserve">
+    <value>Al jugar a un juego desbloqueado por Lua, lo muestra como tu estado de Steam en lugar de aparecer conectado pero sin jugar.</value>
+  </data>
+  <data name="Settings_SwitchMode" xml:space="preserve">
+    <value>Cambiar modo</value>
+  </data>
+  <data name="Settings_SwitchModeHint" xml:space="preserve">
+    <value>Elige entre ST Fixer (solo correcciones básicas) y Cloud Redirect (añade redirección de guardados en la nube).</value>
+  </data>
+  <data name="Settings_SwitchModeTitle" xml:space="preserve">
+    <value>Modo de la app</value>
+  </data>
+  <data name="Stats_AccountHeader" xml:space="preserve">
+    <value>Cuenta {0}</value>
+  </data>
+  <data name="Stats_AchievementBit" xml:space="preserve">
+    <value>Estadística {0} - bit {1}</value>
+  </data>
+  <data name="Stats_AchievementsHeader" xml:space="preserve">
+    <value>Logros</value>
+  </data>
+  <data name="Stats_AppFallbackName" xml:space="preserve">
+    <value>App {0}</value>
+  </data>
+  <data name="Stats_Hint" xml:space="preserve">
+    <value>Consulta los datos de logros y tiempo de juego en la nube de tus apps inyectadas.</value>
+  </data>
+  <data name="Stats_Hours" xml:space="preserve">
+    <value>{0} h</value>
+  </data>
+  <data name="Stats_LastPlayed" xml:space="preserve">
+    <value>ÚLTIMA VEZ JUGADO</value>
+  </data>
+  <data name="Stats_Locked" xml:space="preserve">
+    <value>Bloqueado</value>
+  </data>
+  <data name="Stats_Minutes" xml:space="preserve">
+    <value>{0} min</value>
+  </data>
+  <data name="Stats_Never" xml:space="preserve">
+    <value>Nunca</value>
+  </data>
+  <data name="Stats_NoCloud" xml:space="preserve">
+    <value>No hay ningún proveedor de nube configurado. Configura Google Drive, OneDrive o una carpeta en los ajustes de Proveedor de nube para ver las estadísticas.</value>
+  </data>
+  <data name="Stats_NoData" xml:space="preserve">
+    <value>Aún no hay estadísticas sincronizadas en la nube. Inicia un juego desbloqueado con Lua con CloudRedirect activo, deja que se sincronice y actualiza.</value>
+  </data>
+  <data name="Stats_NoPlaytime" xml:space="preserve">
+    <value>Ninguno</value>
+  </data>
+  <data name="Stats_Playtime2Weeks" xml:space="preserve">
+    <value>ÚLTIMAS 2 SEMANAS</value>
+  </data>
+  <data name="Stats_PlaytimeForever" xml:space="preserve">
+    <value>TIEMPO DE JUEGO (TOTAL)</value>
+  </data>
+  <data name="Stats_Refresh" xml:space="preserve">
+    <value>Actualizar</value>
+  </data>
+  <data name="Stats_StatId" xml:space="preserve">
+    <value>Estadística {0}</value>
+  </data>
+  <data name="Stats_StatsHeader" xml:space="preserve">
+    <value>Estadísticas</value>
+  </data>
+  <data name="Stats_SummaryAchievements" xml:space="preserve">
+    <value>{0} logros</value>
+  </data>
+  <data name="Stats_SummaryPlaytime" xml:space="preserve">
+    <value>{0} jugado</value>
+  </data>
+  <data name="Stats_SummaryStats" xml:space="preserve">
+    <value>{0} estadísticas</value>
+  </data>
 </root>

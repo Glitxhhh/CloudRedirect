@@ -62,16 +62,16 @@
     <value>Apps</value>
   </data>
   <data name="Nav_Cleanup" xml:space="preserve">
-    <value>Cleanup</value>
+    <value>Clean Up</value>
   </data>
   <data name="Nav_ManifestPinning" xml:space="preserve">
     <value>Manifest Pinning</value>
   </data>
   <data name="Nav_Stats" xml:space="preserve">
-    <value>Stats &amp; Playtime</value>
+    <value>Achievements &amp; Playtime</value>
   </data>
   <data name="Stats_Hint" xml:space="preserve">
-    <value>WIP WIP BLAH BLAH BLAH LOREM IPSUM</value>
+    <value>View current cloud achievement/playtime data for your injected apps.</value>
   </data>
   <data name="Stats_Refresh" xml:space="preserve">
     <value>Refresh</value>
@@ -150,13 +150,13 @@
     <value>Choose Your Mode</value>
   </data>
   <data name="Choice_Description" xml:space="preserve">
-    <value>Pick how you want to use CloudRedirect. You can always upgrade from STFixer to Cloud Redirect later.</value>
+    <value>Pick how you want to use CloudRedirect. You can switch between ST Fixer and Cloud Redirect anytime.</value>
   </data>
   <data name="Choice_STFixer_Title" xml:space="preserve">
-    <value>STFixer Mode</value>
+    <value>ST Fixer Mode</value>
   </data>
   <data name="Choice_STFixer_Description" xml:space="preserve">
-    <value>Core fixes. Makes Capcom games save, enables SteamTools activation when some SteamTools servers are down, enables manifest pinning. Does not enable Cloud Saves.</value>
+    <value>Just the core fixes. Solves saving issues with (not just) Capcom titles, fixes 'No Internet Connection' when downloading, enables manifest pinning, makes achievements work for every game that has them. Does not enable Cloud functionality.</value>
   </data>
   <data name="Choice_STFixer_Features" xml:space="preserve">
     <value>Includes: Capcom save fix, SteamTools offline patch, DLL deploy, manifest version pinning</value>
@@ -168,13 +168,13 @@
     <value>Everything in ST Fixer, plus Cloud Save redirection. Redirects Steam Cloud for lua games to Google Drive/OneDrive/a local folder.</value>
   </data>
   <data name="Choice_CloudRedirect_Features" xml:space="preserve">
-    <value>Includes: All STFixer features + cloud save redirect, cloud provider sync, app management, contamination cleanup</value>
+    <value>All ST Fixer features + Cloud Saves to your provider of choice + Achievement and Playtime Sync</value>
   </data>
   <data name="Choice_CurrentMode_STFixer" xml:space="preserve">
-    <value>Current mode: STFixer</value>
+    <value>Current mode: ST Fixer</value>
   </data>
   <data name="Choice_CurrentMode_STFixer_Desc" xml:space="preserve">
-    <value>You can upgrade to Cloud Redirect mode by selecting the option below. This is one-way -- Cloud Redirect includes everything in STFixer plus cloud features.</value>
+    <value>You can switch to Cloud Redirect mode by selecting the option below. Cloud Redirect includes everything in ST Fixer plus cloud features. You can switch back anytime.</value>
   </data>
   <data name="Choice_CurrentMode_CloudRedirect" xml:space="preserve">
     <value>Current mode: Cloud Redirect</value>
@@ -578,6 +578,7 @@ If you skip this, saves will be stored locally in your Steam folder.</value>
   <data name="Dashboard_QuickActions" xml:space="preserve">
     <value>Quick Actions</value>
   </data>
+
   <data name="Dashboard_OpenLogFile" xml:space="preserve">
     <value>Show Log in Folder</value>
   </data>
@@ -723,9 +724,6 @@ Force-kill it?</value>
   <data name="CloudProvider_Cancel" xml:space="preserve">
     <value>Cancel</value>
   </data>
-  <data name="CloudProvider_SaveConfiguration" xml:space="preserve">
-    <value>Save Configuration</value>
-  </data>
 
   <!-- CloudProviderPage code-behind -->
   <data name="CloudProvider_NoConfigFound" xml:space="preserve">
@@ -760,12 +758,6 @@ Force-kill it?</value>
   </data>
   <data name="CloudProvider_MissingPathMessage" xml:space="preserve">
     <value>Please set a token file path first.</value>
-  </data>
-  <data name="CloudProvider_Saved" xml:space="preserve">
-    <value>Saved</value>
-  </data>
-  <data name="CloudProvider_SavedMessage" xml:space="preserve">
-    <value>Configuration saved successfully.</value>
   </data>
   <data name="CloudProvider_FailedSaveConfig" xml:space="preserve">
     <value>Failed to save config: {0}</value>
@@ -1111,10 +1103,10 @@ Skipped {0} file(s) (already exist at original location).</value>
   <!-- CleanupPage XAML                                                   -->
   <!-- ═══════════════════════════════════════════════════════════════════ -->
   <data name="Cleanup_Title" xml:space="preserve">
-    <value>Cleanup</value>
+    <value>Clean Up</value>
   </data>
   <data name="Cleanup_Description" xml:space="preserve">
-    <value>SteamTools redirected all lua apps' cloud saves through app 760, polluting every game's remote/ folder with every other game's files. Scan to see which apps are affected, then select files to remove.</value>
+    <value>SteamTools redirected the cloud saves of all Lua apps through app 760, polluting each Lua app's /&lt;appid&gt;/remote/ folder with all the files that SteamTools synced to 760. Scan to see which apps are affected, then select files to remove.</value>
   </data>
   <data name="Cleanup_OstBanner_Title" xml:space="preserve">
     <value>OpenSteamTool detected</value>
@@ -1153,7 +1145,7 @@ Skipped {0} file(s) (already exist at original location).</value>
     <value>Refresh Backups</value>
   </data>
   <data name="Cleanup_RestoreDescription" xml:space="preserve">
-    <value>Restore files from a previous cleanup backup. Each cleanup run creates an immutable, timestamped backup. Restoring copies files back without modifying the backup.</value>
+    <value>Restore files from a previous clean up backup. Each clean up run creates an immutable, timestamped backup. Restoring copies files back without modifying the backup.</value>
   </data>
   <data name="Cleanup_LoadingBackups" xml:space="preserve">
     <value>Loading backups...</value>
@@ -1191,14 +1183,14 @@ Everything can be restored from the Restore tab.
 Are you sure?</value>
   </data>
   <data name="Cleanup_CleanupCompleteTitle" xml:space="preserve">
-    <value>Cleanup Complete</value>
+    <value>Clean Up Complete</value>
   </data>
   <data name="Cleanup_CleanupCompleteMessage" xml:space="preserve">
     <value>Moved {0} file(s) to backup.
 You can restore them from the Restore tab if needed.</value>
   </data>
   <data name="Cleanup_CleanupFailedTitle" xml:space="preserve">
-    <value>Cleanup Failed</value>
+    <value>Clean Up Failed</value>
   </data>
   <data name="Cleanup_CleanedBannerFormat" xml:space="preserve">
     <value>Cleaned {0} file(s) to backup.</value>
@@ -1256,7 +1248,7 @@ Skipped {0} file(s) (already exist at original location).</value>
     <value>Steam not found.</value>
   </data>
   <data name="Cleanup_UndoNoBackupFound" xml:space="preserve">
-    <value>Could not find the backup from the last cleanup. Use Restore from Backup to find it manually.</value>
+    <value>Could not find the backup from the last clean up. Use Restore from Backup to find it manually.</value>
   </data>
   <data name="Cleanup_UndoCompleteTitle" xml:space="preserve">
     <value>Undo Complete</value>
@@ -1329,7 +1321,7 @@ Skipped {0} file(s) (already exist at original location).</value>
     <value>Select files to remove by checking the boxes.</value>
   </data>
   <data name="Cleanup_ConfirmCleanupTitle" xml:space="preserve">
-    <value>Confirm Cleanup</value>
+    <value>Confirm Clean Up</value>
   </data>
   <data name="Cleanup_ConfirmCleanupMessage" xml:space="preserve">
     <value>This will move {0} file(s) ({1}) to the backup folder.
@@ -1371,6 +1363,21 @@ Files can be restored from the Restore tab. Continue?</value>
   </data>
   <data name="Settings_Reset" xml:space="preserve">
     <value>Reset</value>
+  </data>
+  <data name="Settings_SwitchMode" xml:space="preserve">
+    <value>Switch Mode</value>
+  </data>
+  <data name="Settings_SwitchModeTitle" xml:space="preserve">
+    <value>App Mode</value>
+  </data>
+  <data name="Settings_SwitchModeHint" xml:space="preserve">
+    <value>Choose between ST Fixer (core fixes only) and Cloud Redirect (adds cloud save redirection).</value>
+  </data>
+  <data name="Settings_ModeStFixer" xml:space="preserve">
+    <value>ST Fixer</value>
+  </data>
+  <data name="Settings_ModeCloudRedirect" xml:space="preserve">
+    <value>Cloud Redirect</value>
   </data>
   <data name="Settings_About" xml:space="preserve">
     <value>About</value>
@@ -1438,60 +1445,40 @@ Are you sure?</value>
   <!-- DisclaimerWindow XAML                                              -->
   <!-- ═══════════════════════════════════════════════════════════════════ -->
   <data name="Disclaimer_WindowTitle" xml:space="preserve">
-    <value>WARNING</value>
+    <value>Change Mode?</value>
   </data>
-  <data name="Disclaimer_BuildBanner" xml:space="preserve">
-    <value>CloudRedirect v2.0.3</value>
+  <data name="Disclaimer_Heading" xml:space="preserve">
+    <value>Life is about choices.</value>
   </data>
-  <data name="Disclaimer_ExperimentalBanner" xml:space="preserve">
-    <value>!  EXPERIMENTAL  -  DATA  LOSS  RISK  !</value>
+  <data name="Disclaimer_Intro" xml:space="preserve">
+    <value>There used to be a scary screen here. That screen is gone now. Life is about choices. I mean, life is really about other people but that's a bit heavy for a warning screen. A former warning screen, even.</value>
   </data>
-  <data name="Disclaimer_WarningBold" xml:space="preserve">
-    <value>Cloud Save Redirection is EXPERIMENTAL and under active development.</value>
+  <data name="Disclaimer_HowItWorks" xml:space="preserve">
+    <value>Cloud Redirect does very silly things that results in Steam Cloud operations being redirected towards a provider of your choice. If that provider is Google Drive specifically, you have access to Google Drive file versioning. You can pull down older versions of saves.</value>
   </data>
-  <data name="Disclaimer_ItMay" xml:space="preserve">
-    <value>It may:</value>
+  <data name="Disclaimer_TrackRecord" xml:space="preserve">
+    <value>In practice, this makes Cloud Redirect mode very low risk. I've had maybe...three? reported incidents of data loss in a release build ever. Two were in extremely early versions and I was able to recover the data for the users. One was more recent, caused by a component that does not exist anymore and a network failure at the worst possible time &amp; was not reported to me until days later, resulted in an hour of lost progress. I would have been able to recover the data, but the user progressed past that point before I was sent logs.</value>
   </data>
-  <data name="Disclaimer_Corrupt" xml:space="preserve">
-    <value>CORRUPT</value>
+  <data name="Disclaimer_ChoiceHeading" xml:space="preserve">
+    <value>Time to make a choice.</value>
   </data>
-  <data name="Disclaimer_CorruptSuffix" xml:space="preserve">
-    <value> your save files</value>
+  <data name="Disclaimer_ChoiceIntegrity" xml:space="preserve">
+    <value>If you are worried about the integrity of your on disk saves most of all, this may not be the tool for you. It's been fine for me and for many others, but it may not suit you.</value>
   </data>
-  <data name="Disclaimer_Lose" xml:space="preserve">
-    <value>LOSE</value>
+  <data name="Disclaimer_ChoiceBackup" xml:space="preserve">
+    <value>If your failure scenario is 'reinstalling Windows and forgetting to backup all my saves/hardware failure/game crashes and corrupts save', CR can help.</value>
   </data>
-  <data name="Disclaimer_LoseSuffix" xml:space="preserve">
-    <value> your save data</value>
+  <data name="Disclaimer_ChoiceMultiPC" xml:space="preserve">
+    <value>If you want to play a game across two (or more) different PCs, CR is the best way to do that. It's more reliable than anything else.</value>
   </data>
-  <data name="Disclaimer_Overwrite" xml:space="preserve">
-    <value>OVERWRITE</value>
-  </data>
-  <data name="Disclaimer_OverwriteSuffix" xml:space="preserve">
-    <value> good saves with bad ones</value>
-  </data>
-  <data name="Disclaimer_BackUpBold" xml:space="preserve">
-    <value>BACK UP YOUR SAVES before using this.</value>
-  </data>
-  <data name="Disclaimer_ExplanationText" xml:space="preserve">
-    <value>If something goes wrong, your LOCAL SAVES could be corrupted or lost. Make sure you have backups of any saves you care about before proceeding.</value>
-  </data>
-  <data name="Disclaimer_PleaseReadCarefully" xml:space="preserve">
-    <value>Please read carefully...</value>
+  <data name="Disclaimer_Closing" xml:space="preserve">
+    <value>Make your choice. No judgement.</value>
   </data>
   <data name="Disclaimer_Cancel" xml:space="preserve">
-    <value>Cancel</value>
+    <value>Not for me</value>
   </data>
   <data name="Disclaimer_AcceptButton" xml:space="preserve">
-    <value>I Understand the Risks</value>
-  </data>
-
-  <!-- DisclaimerWindow code-behind -->
-  <data name="Disclaimer_CountdownFormat" xml:space="preserve">
-    <value>Please read carefully... ({0}s)</value>
-  </data>
-  <data name="Disclaimer_Warned" xml:space="preserve">
-    <value>You have been warned.</value>
+    <value>Enable Cloud Redirect Mode?</value>
   </data>
 
   <!-- ═══════════════════════════════════════════════════════════════════ -->
@@ -1677,6 +1664,24 @@ Are you sure?</value>
   <data name="Settings_SyncPlaytimeHint" xml:space="preserve">
     <value>Upload and merge playtime data for lua apps across PCs.</value>
   </data>
+  <data name="CloudProvider_UploadInFlight" xml:space="preserve">
+    <value>Concurrent Upload Size</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightHint" xml:space="preserve">
+    <value>Controls megabytes of files uploading at once. Increasing WILL NOT speed up loads, but increasing it can make multiple large saves fail to upload. Changes are not recommended.</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightValue" xml:space="preserve">
+    <value>{0} MB</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightConservative" xml:space="preserve">
+    <value>Safe (24)</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightBalanced" xml:space="preserve">
+    <value>Balanced (44)</value>
+  </data>
+  <data name="CloudProvider_UploadInFlightAggressive" xml:space="preserve">
+    <value>Aggressive (64)</value>
+  </data>
   <data name="Settings_SyncLuas" xml:space="preserve">
     <value>Sync Lua Files</value>
   </data>
@@ -1690,7 +1695,7 @@ Are you sure?</value>
     <value>Automatically check for and install newer versions of the CloudRedirect DLL when Steam launches. The update takes effect on the next Steam restart.</value>
   </data>
   <data name="Settings_Extra" xml:space="preserve">
-    <value>Quality of Life Placeholder</value>
+    <value>Quality of Life</value>
   </data>
   <data name="Settings_ExtraHint" xml:space="preserve">
     <value>Optional extras that aren't part of cloud sync.</value>

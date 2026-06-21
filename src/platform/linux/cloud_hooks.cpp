@@ -4,6 +4,8 @@
 #include "gamesplayed_hook.h"
 #include "live_playtime.h"
 #include "achievement_inject.h"
+#include "schema_fetch.h"
+#include "recvpkt_hook.h"
 #include "stats_store.h"
 #include "stats_handlers.h"
 #include "metadata_sync.h"
@@ -13,6 +15,7 @@
 #include "pending_ops_journal.h"
 #include "cloud_storage.h"
 #include "cloud_provider.h"
+#include "cloud_provider_base.h" // g_uploadInFlightCapBytes
 #include "http_server.h"
 #include "protobuf.h"
 #include "json.h"
@@ -54,6 +57,14 @@ static std::thread g_cloudPollerThread;
 static std::mutex g_pollerExitMtx;
 static std::condition_variable g_pollerExitCv;
 static std::atomic<bool> g_pollerExited{false};
+
+// SeedApps does per-app cloud I/O; run it off the init thread so a fresh install's
+// hundreds of legacy-migration pulls don't block Steam's userdata load. Tracked +
+// joined like the poller so a wedged curl can't run freed statics at shutdown.
+static std::thread g_seedThread;
+static std::mutex g_seedExitMtx;
+static std::condition_variable g_seedExitCv;
+static std::atomic<bool> g_seedExited{false};
 
 struct HookGuard {
     HookGuard() { g_hookRefCount.fetch_add(1, std::memory_order_acquire); }
@@ -259,6 +270,11 @@ void CloudHooks::InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t st
         LivePlaytime::InstallUserCapture();
 
     AchievementInject::Resolve(steamclientBase, steamclientSize, &SerializeBodyTL);
+    SchemaFetch::Resolve(steamclientBase, steamclientSize, g_parseFromArray);
+
+    // Inbound CM observer: captures our schema-fetch 819 replies and writes the
+    // schema .bin (mirror of the Windows RecvPktMonitorHook).
+    RecvPktHook::Install(steamclientBase, steamclientSize);
 }
 
 static std::optional<CloudIntercept::RpcResult> DispatchCloudRpc(
@@ -308,15 +324,26 @@ static void EnsureInitialized() {
             auto cfg = Json::Parse(configStr);
             std::string providerName = cfg["provider"].str();
 
-            // Native stats/playtime sync gates. Absent -> keep default (ON).
-            // When off, the matching native path does not interfere with Steam.
+            // Native stats/playtime sync gates. Absent -> keep default.
             if (cfg["sync_achievements"].type == Json::Type::Bool)
                 MetadataSync::syncAchievements = cfg["sync_achievements"].boolean();
             if (cfg["sync_playtime"].type == Json::Type::Bool)
                 MetadataSync::syncPlaytime = cfg["sync_playtime"].boolean();
-            LOG("[Stats] Sync gates: achievements=%d, playtime=%d",
+            if (cfg["schema_fetch"].type == Json::Type::Bool)
+                MetadataSync::schemaFetch = cfg["schema_fetch"].boolean();
+
+            // Concurrency cap, not a speed knob (see g_uploadInFlightCapBytes).
+            // Clamp 24..64 MB; out-of-range/absent keeps the 24 MB default.
+            if (cfg["upload_inflight_mb"].type == Json::Type::Number) {
+                int mb = static_cast<int>(cfg["upload_inflight_mb"].integer());
+                if (mb >= 24 && mb <= 64)
+                    g_uploadInFlightCapBytes.store((uint64_t)mb << 20,
+                        std::memory_order_relaxed);
+            }
+            LOG("[Stats] Sync gates: achievements=%d, playtime=%d, schemaFetch=%d",
                 MetadataSync::syncAchievements.load() ? 1 : 0,
-                MetadataSync::syncPlaytime.load() ? 1 : 0);
+                MetadataSync::syncPlaytime.load() ? 1 : 0,
+                MetadataSync::schemaFetch.load() ? 1 : 0);
 
             if (!providerName.empty() && providerName != "local") {
                 provider = CreateCloudProvider(providerName);
@@ -399,7 +426,15 @@ static void EnsureInitialized() {
                 for (const auto& [appId, json] : all) {
                     if (appId == 0) continue;
                     std::string key = std::to_string(appId);
-                    Json::Value appVal = Json::Parse(json);
+                    // Fold our outgoing entry onto the live cloud entry (monotonic
+                    // playtime, union achievements/stats) instead of replacing it,
+                    // so a stale/lower copy can't clobber a higher value another
+                    // device wrote after our startup pull.
+                    std::string baseEntry = root.has(key)
+                        ? Json::Stringify(root.objVal[key]) : std::string();
+                    std::string mergedEntry =
+                        StatsStore::MergeAppStatsJson(baseEntry, json);
+                    Json::Value appVal = Json::Parse(mergedEntry);
                     if (!root.has(key) || !Json::DeepEqual(root.objVal[key], appVal)) {
                         root.objVal[key] = std::move(appVal);
                         changed = true;
@@ -444,13 +479,21 @@ static void EnsureInitialized() {
             []() -> uint32_t { return CloudIntercept::GetAccountId(); });
         StatsStore::Init(cloudRedirectRoot, CloudIntercept::GetSteamPath());
         StatsHandlers::Init();
-        // Seed managed apps so playtime/achievements are available before the
-        // user launches anything: pulls each app's cloud stats blob and imports
-        // Steam's native data. SeedApps also uploads imported stats, so only run it
-        // when a stats feature is enabled (both off = inert).
+        // Seed managed apps on a background thread: SeedApps does a cloud read per
+        // app, which on the init thread would block Steam's userdata load. The store
+        // is g_mutex-serialized so a launch racing the seed is safe.
         if (MetadataSync::syncAchievements.load(std::memory_order_relaxed) ||
-            MetadataSync::syncPlaytime.load(std::memory_order_relaxed))
-            StatsStore::SeedApps(CloudIntercept::GetNamespaceApps());
+            MetadataSync::syncPlaytime.load(std::memory_order_relaxed)) {
+            g_seedThread = std::thread([] {
+                if (!g_shuttingDown.load(std::memory_order_acquire))
+                    StatsStore::SeedApps(CloudIntercept::GetNamespaceApps());
+                {
+                    std::lock_guard<std::mutex> lk(g_seedExitMtx);
+                    g_seedExited.store(true, std::memory_order_release);
+                }
+                g_seedExitCv.notify_all();
+            });
+        }
 
         // Re-pull the cloud every 60s for another device's playtime advances.
         // RefreshFromCloud merges to disk; advanced apps are queued for a live
@@ -485,9 +528,9 @@ static void EnsureInitialized() {
 
         g_initialized.store(true, std::memory_order_release);
         
-        LOG("[Linux] Storage initialized: root=%s, accountId=%u, namespaceApps=%d",
-            storageRoot.c_str(), CloudIntercept::GetAccountId(), 
-            CloudIntercept::HasNamespaceApps() ? 1 : 0);
+        LOG("[Linux] Storage initialized: root=%s, accountId=%u, namespaceApps=%zu",
+            storageRoot.c_str(), CloudIntercept::GetAccountId(),
+            CloudIntercept::GetNamespaceApps().size());
 
         // Manifest system fetches CN/manifest on-demand; no bulk startup sync.
         if (CloudStorage::IsCloudActive()) {
@@ -534,6 +577,8 @@ extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* req
     // Queued 819 achievement responses route to their waiting job here (needs the
     // network thread's coroutine TLS, same as any inbound CM packet).
     AchievementInject::DrainOnNetThread();
+    // Queued 818 schema-fetch requests fire via BAsyncSend on the net thread.
+    SchemaFetch::DrainOnNetThread();
 
     // Native stats / playtime service methods (Player.*) ride this same path.
     // GetUserStats is answered from our store; GetLastPlayedTimes needs the real
@@ -837,6 +882,8 @@ extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
 
 void CloudHooks::BeginShutdown() {
     g_shuttingDown.store(true, std::memory_order_release);
+    SchemaFetch::Shutdown();
+    RecvPktHook::Remove();
     GamesPlayedHook::Remove();
     LivePlaytime::RemoveUserCapture();
     for (int i = 0; i < 300 && g_hookRefCount.load(std::memory_order_acquire) > 0; ++i)
@@ -856,6 +903,21 @@ void CloudHooks::BeginShutdown() {
         } else {
             LOG("[CloudHooks] poller wedged in network call -- detaching");
             g_cloudPollerThread.detach();
+        }
+    }
+
+    // Same bounded-join discipline for the background seed thread.
+    if (g_seedThread.joinable()) {
+        {
+            std::unique_lock<std::mutex> lk(g_seedExitMtx);
+            g_seedExitCv.wait_for(lk, std::chrono::seconds(5),
+                [] { return g_seedExited.load(std::memory_order_acquire); });
+        }
+        if (g_seedExited.load(std::memory_order_acquire)) {
+            g_seedThread.join();
+        } else {
+            LOG("[CloudHooks] seed wedged in network call -- detaching");
+            g_seedThread.detach();
         }
     }
 }

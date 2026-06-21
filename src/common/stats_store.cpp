@@ -31,6 +31,8 @@ static bool ParseAppStatsJson(const std::string& content, AppStats& out);
 // Forward decl: count unlocked achievement bits (used by import diagnostics above
 // its definition).
 static size_t CountUnlockedAchievements(const std::vector<AchievementBlock>& a);
+static bool ReconcileAchievementBits(std::vector<StatEntry>& stats,
+                                     std::vector<AchievementBlock>& achievements);
 static std::unordered_map<uint32_t, AppStats> g_cache;
 static std::unordered_map<uint32_t, bool> g_dirty;
 
@@ -55,6 +57,17 @@ static std::unordered_set<uint32_t> g_cloudBlobMerged;
 // to be re-uploaded; cleared by PushAccountBlobIfDirty. Guarded by g_mutex.
 static bool g_accountBlobDirty = false;
 
+// Apps whose native import was attempted (got data or confirmed none). Distinct
+// from a cache entry, which reconcile/session tracking may create empty. g_mutex.
+static std::unordered_map<uint32_t, bool> g_importAttempted;
+
+// Last accountId we cleared state for, to detect a genuine account switch and
+// wipe the per-account cache once per switch. 0 = none seen. g_mutex.
+static uint32_t g_lastSeenAccountId = 0;
+
+// Active play sessions: appId -> session start (unix time). Guarded by g_mutex.
+static std::unordered_map<uint32_t, uint32_t> g_activeSessions;
+
 // Resolves the current Steam accountId for locating native UserGameStats blobs.
 static AccountIdProvider g_accountIdProvider;
 // Fired when an import finds no schema for an app (platform requests it).
@@ -67,7 +80,10 @@ static void WriteAppStats(uint32_t appId, const AppStats& stats, bool pushCloud,
                           bool bypassDiskMerge = false);
 
 // Playtime helpers (defined below; forward-declared for use in (de)serialization).
-static void RecomputePlaytimeTotals(PlaytimeData& pt);
+// allowShrink: the migration-repair path intentionally lowers a double-counted
+// bucket and needs the totals to follow it down; everywhere else the totals are
+// monotonic (floored at their prior value).
+static void RecomputePlaytimeTotals(PlaytimeData& pt, bool allowShrink = false);
 
 void SetCloudProvider(CloudPullAllFn pullAll, CloudPushAllFn pushAll,
                       CloudPullLegacyFn pullLegacy,
@@ -313,10 +329,50 @@ ParseSchemaAchievementNames(const std::vector<BkvNode>& schemaRoot) {
     return names;
 }
 
+// Parse per-stat merge strategy from the schema BKV. Schema shape:
+//   <appId> > stats > <statId> > type_int, resolution_method
+// Steam's rules: type_int=4 -> OR (achievements); else resolution_method: 1=OR, 2=MAX, 3=overwrite.
+std::unordered_map<uint32_t, StatMerge>
+ParseSchemaMergeMethods(const std::vector<BkvNode>& schemaRoot) {
+    std::unordered_map<uint32_t, StatMerge> out;
+
+    const BkvNode* statsSec = nullptr;
+    for (const auto& top : schemaRoot) {
+        if (top.type != BKV_SECTION) continue;
+        if (auto* s = BkvFind(top.children, "stats")) { statsSec = s; break; }
+        if (top.name == "stats") { statsSec = &top; break; }
+    }
+    if (!statsSec) return out;
+
+    for (const auto& stat : statsSec->children) {
+        if (stat.type != BKV_SECTION) continue;
+        bool numeric = !stat.name.empty();
+        for (char c : stat.name) { if (c < '0' || c > '9') { numeric = false; break; } }
+        if (!numeric) continue;
+        uint32_t statId = (uint32_t)strtoul(stat.name.c_str(), nullptr, 10);
+
+        int typeInt = 0, resMeth = 0;
+        if (const BkvNode* ti = BkvFind(stat.children, "type_int"))
+            typeInt = (int)ti->intVal;
+        if (const BkvNode* rm = BkvFind(stat.children, "resolution_method"))
+            resMeth = (int)rm->intVal;
+
+        if (typeInt == 4) {
+            out[statId] = StatMerge::BitwiseOr;
+        } else if (resMeth == 1) {
+            out[statId] = StatMerge::BitwiseOr;
+        } else if (resMeth == 2) {
+            // type_int: 1=INT (signed), 2=FLOAT, 3=AVGRATE (float)
+            out[statId] = (typeInt >= 2) ? StatMerge::MaxFloat : StatMerge::MaxInt;
+        } else {
+            out[statId] = StatMerge::Overwrite;
+        }
+    }
+    return out;
+}
+
 } // namespace
 
-// Active play sessions: appId -> session start (unix time)
-static std::unordered_map<uint32_t, uint32_t> g_activeSessions;
 
 static uint32_t NowUnix() {
     return (uint32_t)std::chrono::duration_cast<std::chrono::seconds>(
@@ -447,14 +503,24 @@ static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string
             // bucket so it's surfaced and max'd across devices without
             // double-counting later CR-tracked sessions (keyed by hostname).
             static const std::string kMigratedBucket = "__migrated_localconfig";
-            if (stats.playtime.perDevice.empty() && vdfPlaytime > 0) {
+            bool migExists = stats.playtime.perDevice.count(kMigratedBucket) > 0;
+            if (!migExists && vdfPlaytime > 0) {
+                // Shortfall above all other buckets (e.g. __legacy_* shimmed from
+                // cloud platform totals) so we never double-count.
+                uint64_t otherTotal = 0;
+                for (const auto& [dev, dp] : stats.playtime.perDevice) {
+                    if (dev == kMigratedBucket) continue;
+                    otherTotal += (uint64_t)dp.windows + dp.mac + dp.lin;
+                }
+                uint32_t shortfall = (vdfPlaytime > otherTotal)
+                    ? (uint32_t)(vdfPlaytime - otherTotal) : 0u;
                 DevicePlaytime& mig = stats.playtime.perDevice[kMigratedBucket];
 #ifdef _WIN32
-                mig.windows = vdfPlaytime;
+                mig.windows = shortfall;
 #elif defined(__APPLE__)
-                mig.mac = vdfPlaytime;
+                mig.mac = shortfall;
 #else
-                mig.lin = vdfPlaytime;
+                mig.lin = shortfall;
 #endif
                 stats.playtime.minutesLastTwoWeeks =
                     (std::max)(stats.playtime.minutesLastTwoWeeks, vdfPlaytime2wks);
@@ -463,6 +529,12 @@ static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string
             }
 
             if (!changed) return true;
+
+            // Ensure derived totals reflect the authoritative per-device buckets
+            // before we persist/log: the lastPlayed-only branch above doesn't touch
+            // them, so the log line (and the on-disk derived fields) would otherwise
+            // show whatever was loaded rather than the reconciled state.
+            RecomputePlaytimeTotals(stats.playtime);
 
             // Local-only persist: startup reconcile must not push to the cloud.
             WriteAppStats(appId, stats, false);
@@ -492,6 +564,46 @@ void Init(const std::string& storageRoot, const std::string& steamPath) {
     LOG("[Stats] Store initialized at %s", g_storageRoot.c_str());
 }
 
+bool ResetForAccountSwitch(uint32_t newAccountId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    // First account seen this process: record it, nothing to wipe. A genuine
+    // switch is only newAccountId != g_lastSeenAccountId with a prior non-zero
+    // value. accountId 0 (not-yet-resolved) must never be treated as a switch.
+    if (newAccountId == 0) return false;
+    if (g_lastSeenAccountId == 0) {
+        g_lastSeenAccountId = newAccountId;
+        return false;
+    }
+    if (newAccountId == g_lastSeenAccountId) return false;
+
+    // Genuine account switch: hard-clear all per-account state and DROP pending
+    // dirty (don't flush) so no post-switch push carries the previous account's stats.
+    LOG("[Stats] Account switch %u -> %u: clearing %zu cached app(s), %zu dirty, "
+        "%zu active session(s)", g_lastSeenAccountId, newAccountId,
+        g_cache.size(), g_dirty.size(), g_activeSessions.size());
+    g_cache.clear();
+    g_importAttempted.clear();
+    g_cloudBlobByApp.clear();
+    g_cloudBlobMerged.clear();
+    g_dirty.clear();
+    g_activeSessions.clear();
+    g_accountBlobDirty = false;
+    g_lastSeenAccountId = newAccountId;
+    return true;
+}
+
+void ResetForTesting() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_cache.clear();
+    g_importAttempted.clear();
+    g_cloudBlobByApp.clear();
+    g_cloudBlobMerged.clear();
+    g_dirty.clear();
+    g_activeSessions.clear();
+    g_accountBlobDirty = false;
+    g_lastSeenAccountId = 0;
+}
+
 // Import Steam's native UserGameStats + schema blobs for an app into `out`.
 // Returns true if real stat data was imported. Used to seed our authoritative
 // store on first access (so we can answer GetUserStats with real data).
@@ -509,10 +621,10 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
         if (sf.good()) {
             out.schema.assign(std::istreambuf_iterator<char>(sf),
                               std::istreambuf_iterator<char>());
+            LOG("[Stats] ImportNativeStats app=%u: schema read %zuB", appId, out.schema.size());
         }
-        // No schema on disk -> ask the platform to fetch it from Steam's server
-        // (so achievement names become available on the next import).
-        if (out.schema.empty() && g_schemaMissingCb)
+        // Refresh schema from Steam's server (picks up newly-added achievements).
+        if (g_schemaMissingCb)
             g_schemaMissingCb(appId);
     }
 
@@ -535,30 +647,34 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
     f.close();
     if (blob.empty()) {
         LOG("[Stats] ImportNativeStats app=%u: native blob is empty (0 bytes)", appId);
-        return false;
+        return !out.schema.empty();
     }
 
     size_t pos = 0, nodeCount = 0;
     std::vector<BkvNode> root;
     if (!BkvRead(blob.data(), blob.size(), pos, root, 0, nodeCount)) {
         LOG("[Stats] ImportNativeStats app=%u: BKV parse failed (%zu bytes)", appId, blob.size());
-        return false;
+        return !out.schema.empty();
     }
 
     const BkvNode* cache = BkvFind(root, "cache");
     if (!cache) {
         LOG("[Stats] ImportNativeStats app=%u: no 'cache' node in native blob (%zu bytes)",
             appId, blob.size());
-        return false;
+        return !out.schema.empty();
     }
 
-    // Parse the schema (if present) for human-readable achievement names.
+    // Parse the schema (if present) for human-readable achievement names and
+    // per-stat merge strategies (type_int / resolution_method).
     std::unordered_map<uint64_t, std::string> achNames;
+    std::unordered_map<uint32_t, StatMerge> mergeMethods;
     if (!out.schema.empty()) {
         size_t spos = 0, snodes = 0;
         std::vector<BkvNode> sroot;
-        if (BkvRead(out.schema.data(), out.schema.size(), spos, sroot, 0, snodes))
+        if (BkvRead(out.schema.data(), out.schema.size(), spos, sroot, 0, snodes)) {
             achNames = ParseSchemaAchievementNames(sroot);
+            mergeMethods = ParseSchemaMergeMethods(sroot);
+        }
     }
 
     size_t importedStats = 0, importedAch = 0;
@@ -575,7 +691,10 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
         if (!dataNode) continue;
         uint32_t value = BkvDataAsU32(*dataNode);
 
-        out.stats.push_back(StatEntry{statId, value});
+        StatMerge mm = StatMerge::Overwrite;
+        auto mmIt = mergeMethods.find(statId);
+        if (mmIt != mergeMethods.end()) mm = mmIt->second;
+        out.stats.push_back(StatEntry{statId, value, mm});
         ++importedStats;
 
         // Achievement unlock times -> AchievementBlock. The 'data' INT is the
@@ -603,10 +722,11 @@ static bool ImportNativeStats(uint32_t appId, AppStats& out) {
         }
     }
 
+    ReconcileAchievementBits(out.stats, out.achievements);
     LOG("[Stats] ImportNativeStats app=%u: imported %zu stat(s), %zu achievement block(s) "
         "(%zu unlocked), schema=%zu bytes", appId, importedStats, importedAch,
         CountUnlockedAchievements(out.achievements), out.schema.size());
-    return importedStats > 0;
+    return importedStats > 0 || !out.schema.empty();
 }
 
 // Parse the JSON document (stats/achievements/playtime) into `out`.
@@ -627,6 +747,9 @@ static bool ParseAppStatsJson(const std::string& content, AppStats& out) {
             StatEntry e;
             e.statId = (uint32_t)item["id"].integer();
             e.value = (uint32_t)item["value"].integer();
+            const auto& mf = item["merge"];
+            if (mf.type == Json::Type::Number)
+                e.merge = static_cast<StatMerge>((uint8_t)mf.integer());
             out.stats.push_back(e);
         }
     }
@@ -653,6 +776,8 @@ static bool ParseAppStatsJson(const std::string& content, AppStats& out) {
         }
     }
 
+    ReconcileAchievementBits(out.stats, out.achievements);
+
     const auto& pt = root["playtime"];
     if (pt.type == Json::Type::Object) {
         out.playtime.minutesForever = (uint32_t)pt["minutes_forever"].integer();
@@ -673,10 +798,10 @@ static bool ParseAppStatsJson(const std::string& content, AppStats& out) {
                 dp.lin     = (uint32_t)v["linux"].integer();
                 out.playtime.perDevice[dev] = dp;
             }
-        } else {
-            // Back-compat: a pre-per-device blob carried only platform totals. Shim
-            // each into a synthetic legacy bucket so sums survive and new writes
-            // accumulate.
+        }
+        // Empty perDevice with real platform totals (legacy blob or off-playtime
+        // push): shim totals into synthetic legacy buckets so they aren't zeroed.
+        if (out.playtime.perDevice.empty()) {
             if (out.playtime.playtimeWindows)
                 out.playtime.perDevice["__legacy_windows"].windows = out.playtime.playtimeWindows;
             if (out.playtime.playtimeMac)
@@ -700,6 +825,8 @@ static std::string BuildAppStatsJson(const AppStats& stats) {
         Json::Value item = Json::Object();
         item.objVal["id"] = Json::Number(s.statId);
         item.objVal["value"] = Json::Number(s.value);
+        if (s.merge != StatMerge::Overwrite)
+            item.objVal["merge"] = Json::Number((uint32_t)s.merge);
         statsArr.arrVal.push_back(std::move(item));
     }
     root.objVal["stats"] = std::move(statsArr);
@@ -766,7 +893,7 @@ static const std::string& ThisDeviceId() {
 }
 
 // Recompute the derived totals from the authoritative per-device sub-totals.
-static void RecomputePlaytimeTotals(PlaytimeData& pt) {
+static void RecomputePlaytimeTotals(PlaytimeData& pt, bool allowShrink) {
     uint64_t win = 0, mac = 0, lin = 0;
     for (const auto& [dev, dp] : pt.perDevice) {
         win += dp.windows; mac += dp.mac; lin += dp.lin;
@@ -774,10 +901,23 @@ static void RecomputePlaytimeTotals(PlaytimeData& pt) {
     auto clamp32 = [](uint64_t v) -> uint32_t {
         return v > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)v;
     };
-    pt.playtimeWindows = clamp32(win);
-    pt.playtimeMac     = clamp32(mac);
-    pt.playtimeLinux   = clamp32(lin);
-    pt.minutesForever  = clamp32(win + mac + lin);
+    if (allowShrink) {
+        // Migration repair: the bucket sum is now authoritative and may be lower
+        // than before (a double-count was removed).
+        pt.playtimeWindows = clamp32(win);
+        pt.playtimeMac     = clamp32(mac);
+        pt.playtimeLinux   = clamp32(lin);
+        pt.minutesForever  = clamp32(win + mac + lin);
+        return;
+    }
+    // Playtime only ever goes up. The per-device buckets are the source of truth,
+    // but a partial/empty perDevice (e.g. a blob parsed before its legacy shim, or
+    // an off-playtime push that dropped buckets) must never drag a known total
+    // DOWN. Floor each recomputed total at whatever the struct already carried.
+    pt.playtimeWindows = (std::max)(pt.playtimeWindows, clamp32(win));
+    pt.playtimeMac     = (std::max)(pt.playtimeMac,     clamp32(mac));
+    pt.playtimeLinux   = (std::max)(pt.playtimeLinux,   clamp32(lin));
+    pt.minutesForever  = (std::max)(pt.minutesForever,  clamp32(win + mac + lin));
 }
 
 // Accrue minutes onto THIS device's own per-device sub-total for this platform.
@@ -893,10 +1033,56 @@ static size_t CountUnlockedAchievements(const std::vector<AchievementBlock>& a) 
     return n;
 }
 
-// Merge stat values from src into dst, last-writer-wins per statId: src (native,
-// authoritative for its own values) overwrites dst on any difference -- not max(),
-// since stats are non-monotonic and a reset must win. dst-only statIds are kept;
-// src-only are appended. Returns true if dst changed.
+// OR each achievement block's `bits` into the matching stat value (MergeAchievements
+// updates bits but not stats[].value). Only `a.bits`, so revoked unlocks stay cleared.
+static bool ReconcileAchievementBits(std::vector<StatEntry>& stats,
+                                     std::vector<AchievementBlock>& achievements) {
+    bool changed = false;
+    for (auto& a : achievements) {
+        // Promote unlock times → bits only when the bit is already set (not orphaned).
+        // But DO promote bits → stat_val unconditionally (the actual bug fix).
+        for (auto& s : stats) {
+            if (s.statId == a.statId) {
+                if ((s.value | a.bits) != s.value) { s.value |= a.bits; changed = true; }
+                break;
+            }
+        }
+    }
+    return changed;
+}
+
+// Resolve the effective merge method for two entries (prefer the one that has a
+// non-default method; if both are set they should agree since they come from the
+// same schema -- pick the more protective one).
+static StatMerge EffectiveMerge(StatMerge a, StatMerge b) {
+    if (a != StatMerge::Overwrite) return a;
+    return b;
+}
+
+// Apply schema-aware merge for a single stat value. Returns the merged value.
+static uint32_t MergedValue(uint32_t dst, uint32_t src, StatMerge method) {
+    switch (method) {
+        case StatMerge::BitwiseOr:
+            return dst | src;
+        case StatMerge::MaxInt: {
+            int32_t d, s;
+            std::memcpy(&d, &dst, 4);
+            std::memcpy(&s, &src, 4);
+            return (s > d) ? src : dst;
+        }
+        case StatMerge::MaxFloat: {
+            float df, sf;
+            std::memcpy(&df, &dst, 4);
+            std::memcpy(&sf, &src, 4);
+            return (sf > df) ? src : dst;
+        }
+        default: // Overwrite: source wins
+            return src;
+    }
+}
+
+// Merge src into dst per-stat: Overwrite for authoritative native reimport, OR/MAX
+// for cloud merge (regression-safe). Returns true if dst changed.
 static bool MergeStatValues(std::vector<StatEntry>& dst,
                             const std::vector<StatEntry>& src) {
     bool changed = false;
@@ -904,7 +1090,12 @@ static bool MergeStatValues(std::vector<StatEntry>& dst,
         bool found = false;
         for (auto& d : dst) {
             if (d.statId == s.statId) {
-                if (d.value != s.value) { d.value = s.value; changed = true; }
+                StatMerge method = EffectiveMerge(d.merge, s.merge);
+                // Adopt the merge method from src if dst didn't have one.
+                if (d.merge == StatMerge::Overwrite && s.merge != StatMerge::Overwrite)
+                    d.merge = s.merge;
+                uint32_t merged = MergedValue(d.value, s.value, method);
+                if (d.value != merged) { d.value = merged; changed = true; }
                 found = true;
                 break;
             }
@@ -912,6 +1103,29 @@ static bool MergeStatValues(std::vector<StatEntry>& dst,
         if (!found) { dst.push_back(s); changed = true; }
     }
     return changed;
+}
+
+// Fold `incoming` onto `base` (same app) with the in-store monotonic rules:
+// union playtime, union achievements, stat-value merge. Pure function.
+std::string MergeAppStatsJson(const std::string& base, const std::string& incoming) {
+    AppStats baseStats, incomingStats;
+    bool haveBase = !base.empty() && ParseAppStatsJson(base, baseStats);
+    bool haveIncoming = !incoming.empty() && ParseAppStatsJson(incoming, incomingStats);
+
+    // Degenerate cases: if only one side parses, it is the answer. If neither
+    // parses, prefer the caller's own outgoing copy.
+    if (!haveBase && !haveIncoming) return incoming;
+    if (!haveBase) return incoming;
+    if (!haveIncoming) return base;
+
+    // Union/max both sides; order-independent for monotonic fields.
+    MergePlaytime(baseStats.playtime, incomingStats.playtime);
+    MergeAchievements(baseStats.achievements, incomingStats.achievements);
+    MergeStatValues(baseStats.stats, incomingStats.stats);
+    ReconcileAchievementBits(baseStats.stats, baseStats.achievements);
+    // Recompute crc over the merged result, not either side's stale token.
+    baseStats.crcStats = ComputeCrcLocked(baseStats);
+    return BuildAppStatsJson(baseStats);
 }
 
 // Disk-only load (stats json + schema sidecar), NO network. Safe to call while
@@ -959,6 +1173,7 @@ static bool MergeCloudBlobLocked(uint32_t appId, AppStats& out, bool haveLocal) 
         // preserved instead of clobbered on next push.
         MergeAchievements(out.achievements, cloudStats.achievements);
         MergeStatValues(out.stats, cloudStats.stats);
+        ReconcileAchievementBits(out.stats, out.achievements);
         // Schema is descriptive; adopt cloud's only when we hold none.
         if (out.schema.empty() && !cloudStats.schema.empty())
             out.schema = std::move(cloudStats.schema);
@@ -1033,6 +1248,17 @@ static void WriteAppStats(uint32_t appId, const AppStats& stats, bool pushCloud,
         }
     }
 
+    // Max-merge the cached cloud playtime so an achievement-path push carrying
+    // empty playtime can't regress account-wide minutes. Skipped on bypassDiskMerge.
+    if (pushCloud && !bypassDiskMerge) {
+        auto it = g_cloudBlobByApp.find(appId);
+        if (it != g_cloudBlobByApp.end() && !it->second.empty()) {
+            AppStats cloudPrior;
+            if (ParseAppStatsJson(it->second, cloudPrior))
+                MergePlaytime(merged.playtime, cloudPrior.playtime);
+        }
+    }
+
     std::string json = BuildAppStatsJson(merged);
 
     std::ofstream f(path, std::ios::trunc);
@@ -1086,12 +1312,6 @@ void SaveAppStats(uint32_t appId, const AppStats& stats) {
     WriteAppStats(appId, stats, true);
 }
 
-// Apps for which native import has been successfully attempted (imported real
-// data OR confirmed Steam genuinely has none). Distinct from a cache entry,
-// because reconcile/session-tracking can create an empty cache entry before any
-// import runs -- we must still import on first stats access in that case.
-static std::unordered_map<uint32_t, bool> g_importAttempted;
-
 // Seed `stats` from Steam's native UserGameStats blob if we hold no stat data
 // yet. Retries across calls while accountId is unavailable (returns 0); only
 // marks "attempted" once we had a real accountId to look with. Caller holds mutex.
@@ -1105,6 +1325,10 @@ static void EnsureNativeImportLocked(uint32_t appId, AppStats& stats) {
     // schema is still missing (e.g. SteamTools wrote it after our first try), keep
     // retrying so cloud-adopted achievements eventually become serveable.
     if (g_importAttempted.count(appId) && !stats.schema.empty()) return;
+    LOG("[Stats] EnsureNativeImport app=%u: stats=%zu schema=%zuB attempted=%d accountReady=%d",
+        appId, stats.stats.size(), stats.schema.size(),
+        (int)g_importAttempted.count(appId),
+        (g_accountIdProvider && g_accountIdProvider() != 0) ? 1 : 0);
     if (!g_accountIdProvider || g_accountIdProvider() == 0) {
         // accountId not ready yet (not logged in) -- don't mark attempted; retry later.
         return;
@@ -1116,7 +1340,11 @@ static void EnsureNativeImportLocked(uint32_t appId, AppStats& stats) {
     g_importAttempted[appId] = true; // accountId was valid; this is a definitive attempt
     if (imported) {
         // Adopt the schema even on a schema-only import (no native stats blob).
-        if (!native.schema.empty()) stats.schema = std::move(native.schema);
+        bool schemaAdopted = false;
+        if (!native.schema.empty()) {
+            stats.schema = std::move(native.schema);
+            schemaAdopted = true;
+        }
         // Merge, don't overwrite: cloud-adopted state may hold more unlocks than this
         // device's native blob (e.g. DOOM 3 BFG -- cloud 9, local native 8). A wholesale
         // assign dropped the cloud-only unlock. Union achievements (monotonic); stat
@@ -1128,6 +1356,7 @@ static void EnsureNativeImportLocked(uint32_t appId, AppStats& stats) {
             merged |= MergeAchievements(stats.achievements, native.achievements);
         if (!native.stats.empty())
             merged |= MergeStatValues(stats.stats, native.stats);
+        merged |= ReconcileAchievementBits(stats.stats, stats.achievements);
         size_t haveAfter = CountUnlockedAchievements(stats.achievements);
         // If cloud (haveBefore) held more than native, the merge must keep the
         // superset -- haveAfter dropping below haveBefore means an unlock was lost.
@@ -1135,7 +1364,7 @@ static void EnsureNativeImportLocked(uint32_t appId, AppStats& stats) {
             "(stats=%zu schema=%zuB)%s", appId, haveBefore, nativeHas, haveAfter,
             stats.stats.size(), stats.schema.size(),
             haveAfter < haveBefore ? " [WARN: unlock regressed]" : "");
-        if (merged || !native.schema.empty()) {
+        if (merged || schemaAdopted) {
             stats.crcStats = ComputeCrcLocked(stats);
             g_dirty[appId] = true;
             SaveAppStats(appId, stats);
@@ -1156,6 +1385,7 @@ static bool ReimportNativeStatsLocked(uint32_t appId, AppStats& stats) {
 
     bool changed = MergeStatValues(stats.stats, native.stats);
     if (MergeAchievements(stats.achievements, native.achievements)) changed = true;
+    if (ReconcileAchievementBits(stats.stats, stats.achievements)) changed = true;
     if (stats.schema.empty() && !native.schema.empty()) {
         stats.schema = std::move(native.schema);
         changed = true;
@@ -1171,12 +1401,15 @@ void CaptureNativeUnlocks(uint32_t appId) {
         auto& stats = g_cache[appId];
         // Make sure the base data exists (first observation may precede any import).
         if (stats.stats.empty()) EnsureNativeImportLocked(appId, stats);
+        size_t beforeCount = CountUnlockedAchievements(stats.achievements);
         if (ReimportNativeStatsLocked(appId, stats)) {
+            size_t afterCount = CountUnlockedAchievements(stats.achievements);
             g_dirty[appId] = true;
             SaveAppStats(appId, stats);   // updates account blob + dirty flag
             g_dirty[appId] = false;
             changed = true;
-            LOG("[Stats] Captured native unlocks for app %u (crc=%u)", appId, stats.crcStats);
+            LOG("[Stats] Captured native unlocks for app %u (crc=%u) %zu->%zu unlocked",
+                appId, stats.crcStats, beforeCount, afterCount);
         }
     }
     // A genuine unlock just landed -- push the account blob now (off-lock).
@@ -1236,6 +1469,10 @@ void ResetStats(uint32_t appId) {
     stats.achievements.clear();
     stats.crcStats = 0;
     g_dirty[appId] = true;
+    // Persist the cleared record as a cloud tombstone so the monotonic union
+    // merge can't resurrect the old bits on the next fetch.
+    WriteAppStats(appId, stats, /*pushCloud=*/true);
+    g_dirty[appId] = false;
 }
 
 // One-time migration off the legacy per-app cloud layout: for each managed app
@@ -1317,7 +1554,7 @@ static void ApplyLegacyPlaytime(uint32_t appId, uint32_t mins,
         (std::max)(stats.playtime.minutesLastTwoWeeks, twoWks);
     if (lastPlayed > stats.playtime.lastPlayedTime)
         stats.playtime.lastPlayedTime = lastPlayed;
-    RecomputePlaytimeTotals(stats.playtime);
+    RecomputePlaytimeTotals(stats.playtime, /*allowShrink=*/true);
     g_dirty[appId] = true;
     // bypassDiskMerge: this write must be allowed to shrink __migrated_localconfig.
     WriteAppStats(appId, stats, true, /*bypassDiskMerge=*/true);
@@ -1451,6 +1688,70 @@ void SeedApps(const std::vector<uint32_t>& appIds) {
     PushAccountBlobIfDirty();
 }
 
+void RetryNativeImportsAfterLogin() {
+    // Needs a resolved accountId; the whole point is to run AFTER login so the
+    // import that the boot-time sweep skipped (accountReady=0) can succeed.
+    std::string steamPath;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_accountIdProvider || g_accountIdProvider() == 0) {
+            LOG("[Stats] RetryNativeImports: accountId not ready, skipping");
+            return;
+        }
+        if (g_steamPath.empty() || !g_isNamespaceApp) {
+            LOG("[Stats] RetryNativeImports: steamPath/namespace predicate unset, skipping");
+            return;
+        }
+        steamPath = g_steamPath;
+    }
+
+    // Enumerate native schema blobs: appcache/stats/UserGameStatsSchema_<appId>.bin.
+    // Each such app has a schema on disk; a namespace app among them that never
+    // imported (boot sweep ran pre-login) is exactly what we want to retry.
+    std::error_code ec;
+    fs::path statsDir = FileUtil::Utf8ToPath(steamPath) / "appcache" / "stats";
+    if (!fs::is_directory(statsDir, ec)) {
+        LOG("[Stats] RetryNativeImports: %s not a directory, skipping", statsDir.string().c_str());
+        return;
+    }
+
+    const std::string kPrefix = "UserGameStatsSchema_";
+    int considered = 0, imported = 0;
+    for (const auto& entry : fs::directory_iterator(statsDir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        std::string fname = entry.path().filename().string();
+        if (fname.rfind(kPrefix, 0) != 0) continue;
+        // Strip prefix and ".bin" suffix to recover the appId.
+        size_t dot = fname.rfind(".bin");
+        if (dot == std::string::npos || dot <= kPrefix.size()) continue;
+        std::string idStr = fname.substr(kPrefix.size(), dot - kPrefix.size());
+        if (idStr.empty()) continue;
+        uint32_t appId = 0;
+        bool numeric = true;
+        for (char c : idStr) {
+            if (c < '0' || c > '9') { numeric = false; break; }
+            appId = appId * 10 + (uint32_t)(c - '0');
+        }
+        if (!numeric || appId == 0) continue;
+        if (!g_isNamespaceApp(appId)) continue;
+        ++considered;
+        // Sample emptiness before/after the import under one lock hold so only an
+        // empty->populated transition counts as a genuine new import.
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto preIt = g_cache.find(appId);
+        bool hadData = preIt != g_cache.end() &&
+                       (!preIt->second.stats.empty() || !preIt->second.schema.empty());
+        AppStats& s = GetOrCreateLocked(appId);
+        bool hasData = !s.stats.empty() || !s.schema.empty();
+        if (!hadData && hasData) ++imported;
+    }
+    LOG("[Stats] RetryNativeImports: considered %d namespace app(s) with schema, %d have data",
+        considered, imported);
+    // Deliberately NO PushAccountBlobIfDirty() here: the sweep only flags dirty;
+    // the next natural push (unlock capture / EndSession / FlushAll) uploads.
+}
+
 std::vector<uint32_t> RefreshFromCloud(const std::vector<uint32_t>& appIds) {
     std::vector<uint32_t> changed;
     // One network read for the whole account, then iterate from the cache.
@@ -1484,6 +1785,7 @@ std::vector<uint32_t> RefreshFromCloud(const std::vector<uint32_t>& appIds) {
         // overwrites it on the cloud.
         bool achChanged = MergeAchievements(cur.achievements, cloudStats.achievements);
         bool statChanged = MergeStatValues(cur.stats, cloudStats.stats);
+        if (ReconcileAchievementBits(cur.stats, cur.achievements)) { achChanged = true; statChanged = true; }
         bool playtimeChanged = (cur.playtime.minutesForever != before.minutesForever ||
                                 cur.playtime.lastPlayedTime != before.lastPlayedTime);
         // Another device advanced this app -> persist locally and report.
@@ -1618,18 +1920,26 @@ uint32_t SetAchievement(uint32_t appId, uint32_t statId, uint32_t bit, uint32_t 
 
 void SetSchema(uint32_t appId, const uint8_t* data, size_t len) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto& stats = g_cache[appId];
+    // Seed via GetOrCreateLocked, not operator[]: a first-touch SetSchema must not
+    // insert a blank record that bypasses the cloud-blob merge (other devices'
+    // achievements would then be missing from the entry a later push publishes).
+    AppStats& stats = GetOrCreateLocked(appId);
     stats.schema.assign(data, data + len);
     g_dirty[appId] = true;
 }
 
 const std::vector<uint8_t>& GetSchema(uint32_t appId) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_cache[appId].schema;
+    // Seed before returning: operator[] would default-construct an unmerged blank
+    // entry on a miss (same hazard the mutating setters avoid).
+    return GetOrCreateLocked(appId).schema;
 }
 
 void StartSession(uint32_t appId) {
     std::lock_guard<std::mutex> lock(g_mutex);
+    // Flush any open session first: native Steam resumes the existing per-app
+    // timer rather than re-arming, so a duplicate GamesPlayed can't drop minutes.
+    EndSessionLocked(appId);
     g_activeSessions[appId] = NowUnix();
     // Seed via GetOrCreateLocked (local + cloud blob + native). Hand-rolling g_cache[]
     // skipped the cloud merge on reconcile-touched entries, so EndSession then pushed
@@ -1640,40 +1950,53 @@ void StartSession(uint32_t appId) {
     LOG("[Stats] Session started for app %u", appId);
 }
 
+// Accrue + persist the in-flight session for `appId`, erasing it from
+// g_activeSessions. Caller holds g_mutex. Returns false if no session was open.
+// Shared by EndSession and the re-entrant-StartSession flush.
+static bool EndSessionLocked(uint32_t appId) {
+    auto it = g_activeSessions.find(appId);
+    if (it == g_activeSessions.end()) return false;
+
+    uint32_t now = NowUnix();
+    uint32_t elapsed = (now > it->second) ? (now - it->second) : 0;
+    // Wall-clock sanity cap: a forward clock jump (NTP correction, suspend/
+    // resume) must not over-count a session. Backward jumps already clamp to 0.
+    const uint32_t kMaxSessionSecs = 24u * 60 * 60;
+    if (elapsed > kMaxSessionSecs) elapsed = kMaxSessionSecs;
+    uint32_t minutes = elapsed / 60;
+    g_activeSessions.erase(it);
+
+    // Seed first so the cloud blob's cross-device unlocks are in the record we
+    // build+push (else EndSession drops another device's achievements).
+    AppStats& stats = GetOrCreateLocked(appId);
+    // Accrue onto THIS device's own per-device sub-total (keyed by device id), so
+    // a session here can never overwrite another device's contribution -- even a
+    // same-platform device's -- under the last-writer-wins cloud blob.
+    AccrueLocalPlaytime(stats.playtime, minutes);
+    // Do NOT accumulate minutesLastTwoWeeks: native Steam reads Playtime2wks as an
+    // authoritative stored VDF field, surfaced via ReconcileLocalConfig.
+    stats.playtime.lastPlayedTime = now;
+
+    // Steam flushes the native blob on game close; merge any new unlocks (also
+    // catches another device's). Gated on sync_achievements, not sync_playtime
+    // (EndSession runs under the latter).
+    if (MetadataSync::syncAchievements.load(std::memory_order_relaxed) &&
+        ReimportNativeStatsLocked(appId, stats))
+        LOG("[Stats] Session end: merged new native achievements/stats for app %u (crc=%u)",
+            appId, stats.crcStats);
+
+    g_dirty[appId] = true;
+    SaveAppStats(appId, stats);   // updates account blob + dirty flag
+    g_dirty[appId] = false;
+    LOG("[Stats] Session ended for app %u: +%u min (total %u)",
+        appId, minutes, stats.playtime.minutesForever);
+    return true;
+}
+
 void EndSession(uint32_t appId) {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        auto it = g_activeSessions.find(appId);
-        if (it == g_activeSessions.end()) return;
-
-        uint32_t now = NowUnix();
-        uint32_t elapsed = (now > it->second) ? (now - it->second) : 0;
-        uint32_t minutes = elapsed / 60;
-        g_activeSessions.erase(it);
-
-        // Seed first so the cloud blob's cross-device unlocks are in the record we
-        // build+push (else EndSession drops another device's achievements).
-        AppStats& stats = GetOrCreateLocked(appId);
-        // Accrue onto THIS device's own per-device sub-total (keyed by device id), so
-        // a session here can never overwrite another device's contribution -- even a
-        // same-platform device's -- under the last-writer-wins cloud blob.
-        AccrueLocalPlaytime(stats.playtime, minutes);
-        stats.playtime.minutesLastTwoWeeks += minutes;
-        stats.playtime.lastPlayedTime = now;
-
-        // Steam flushes the native blob on game close; merge any new unlocks (also
-        // catches another device's). Gated on sync_achievements, not sync_playtime
-        // (EndSession runs under the latter).
-        if (MetadataSync::syncAchievements.load(std::memory_order_relaxed) &&
-            ReimportNativeStatsLocked(appId, stats))
-            LOG("[Stats] Session end: merged new native achievements/stats for app %u (crc=%u)",
-                appId, stats.crcStats);
-
-        g_dirty[appId] = true;
-        SaveAppStats(appId, stats);   // updates account blob + dirty flag
-        g_dirty[appId] = false;
-        LOG("[Stats] Session ended for app %u: +%u min (total %u)",
-            appId, minutes, stats.playtime.minutesForever);
+        if (!EndSessionLocked(appId)) return;
     }
     // Push the account blob off-lock (the platform pushAll queues it async, so
     // this never blocks the net thread at game close).
@@ -1682,16 +2005,24 @@ void EndSession(uint32_t appId) {
 
 PlaytimeData GetPlaytime(uint32_t appId) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto& stats = g_cache[appId];
+    // Seed via GetOrCreateLocked, not operator[]: a read on a not-yet-touched app
+    // must not insert a blank unmerged cache entry (which a later lock-holder could
+    // observe in place of the real cloud-merged data).
+    AppStats& stats = GetOrCreateLocked(appId);
     PlaytimeData pt = stats.playtime;
 
     auto it = g_activeSessions.find(appId);
     if (it != g_activeSessions.end()) {
         uint32_t now = NowUnix();
         uint32_t elapsed = (now > it->second) ? (now - it->second) : 0;
+        // Wall-clock sanity cap, matching EndSession: a forward clock jump must not
+        // over-count the in-progress session's live playtime estimate.
+        const uint32_t kMaxSessionSecs = 24u * 60 * 60;
+        if (elapsed > kMaxSessionSecs) elapsed = kMaxSessionSecs;
         uint32_t minutes = elapsed / 60;
         pt.minutesForever += minutes;
-        pt.minutesLastTwoWeeks += minutes;
+        // minutesLastTwoWeeks is authoritative (server-maintained rolling window);
+        // do not pad the live estimate into it (see EndSessionLocked).
     }
     return pt;
 }

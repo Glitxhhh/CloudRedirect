@@ -1,6 +1,7 @@
 #include "gamesplayed_hook.h"
 #include "stats_handlers.h"
 #include "achievement_inject.h"
+#include "schema_fetch.h"
 #include "metadata_sync.h"
 #include "log.h"
 
@@ -37,6 +38,7 @@ static std::atomic<bool> g_shuttingDown{false};
 static std::atomic<int>  g_inFlight{0};
 
 // Detour bookkeeping.
+static uint8_t* g_funcStart = nullptr;     // resolved CCMInterface::Send entry
 static uint8_t* g_hookPoint = nullptr;     // funcStart + PROLOGUE_LEN
 static uint8_t  g_savedBytes[16];          // original bytes at the hook point
 static size_t   g_savedLen = 0;
@@ -73,16 +75,22 @@ static const uint8_t  kSigMask[] = {
 };
 static constexpr size_t kSigLen = sizeof(kSigBytes);
 
-// Observer: runs on Steam's network thread. Read-only.
-extern "C" void GamesPlayedHook_OnSend(int cmInterface, void* msg) {
+// Hook: runs on Steam's network thread. Returns 1 to BLOCK the send (we are
+// the server for this message), 0 to let it pass through normally.
+extern "C" int GamesPlayedHook_OnSend(int cmInterface, void* msg) {
+    int block = 0;
     g_inFlight.fetch_add(1, std::memory_order_acquire);
     if (!g_shuttingDown.load(std::memory_order_acquire) && msg && g_serializeBody) {
         uint32_t emsg = *(uint32_t*)((uint8_t*)msg + OFF_EMSG) & EMSG_MASK;
 
-        // Legacy achievement fetch: queue a 819 response for namespace apps.
+        // Capture session/conn state for proactive schema fetch on every outbound msg
+        SchemaFetch::CaptureFromOutbound(emsg, msg, (void*)(uintptr_t)cmInterface);
+
+        // Legacy achievement fetch: queue a 819 response and block the 818
+        // from reaching Valve so our injected 819 is the sole server response.
         if (emsg == EMSG_GET_USER_STATS &&
             MetadataSync::syncAchievements.load(std::memory_order_relaxed)) {
-            AchievementInject::ObserveOutbound(emsg, msg, (void*)(uintptr_t)cmInterface);
+            block = AchievementInject::ObserveOutbound(emsg, msg, (void*)(uintptr_t)cmInterface);
         }
 
         bool isGamesPlayed = (emsg == EMSG_GAMES_PLAYED ||
@@ -111,25 +119,38 @@ extern "C" void GamesPlayedHook_OnSend(int cmInterface, void* msg) {
         }
     }
     g_inFlight.fetch_sub(1, std::memory_order_release);
+    return block;
 }
 
 // Hand-written 32-bit trampoline, built at runtime to patch absolute targets.
 // The stolen instructions load esi=a1/eax=a2 from the stack, so they run first.
+// OnSend returns 0 (pass through) or 1 (block send, return success to caller).
 //
 //   <STOLEN_LEN stolen bytes>          ; sub esp,1Ch; mov esi,[esp+30]=a1; mov eax,[esp+34]=a2
-//   pushad                            ; 60   save the now-loaded esi/eax (+ all regs)
+//   pushad                            ; 60
 //   push eax                          ; 50   arg2 = msg (a2)
 //   push esi                          ; 56   arg1 = cmInterface (a1)
 //   mov  eax, <OnSend>                ; B8 xx xx xx xx
 //   call eax                          ; FF D0
 //   add  esp, 8                       ; 83 C4 08
-//   popad                             ; 61   restore esi/eax for the resume point
-//   push <resume>                      ; 68 xx xx xx xx
+//   test eax, eax                     ; 85 C0
+//   jnz  block_path                   ; 75 xx
+//   popad                             ; 61
+//   push <resume>                     ; 68 xx xx xx xx
+//   ret                               ; C3
+// block_path:
+//   popad                             ; 61
+//   add  esp, 1Ch                     ; 83 C4 1C    (undo stolen sub esp)
+//   mov  eax, 1                       ; B8 01 00 00 00
+//   pop  ebx                          ; 5B
+//   pop  esi                          ; 5E
+//   pop  edi                          ; 5F
+//   pop  ebp                          ; 5D
 //   ret                               ; C3
 static bool BuildTrampoline(uint8_t* hookPoint) {
     long pageSize = sysconf(_SC_PAGESIZE);
     g_trampoline = (uint8_t*)mmap(nullptr, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_trampoline == MAP_FAILED) {
         g_trampoline = nullptr;
         LOG("[GamesPlayed] mmap trampoline failed");
@@ -154,12 +175,28 @@ static bool BuildTrampoline(uint8_t* hookPoint) {
     emit({0xB8}); emit32((uint32_t)(uintptr_t)&GamesPlayedHook_OnSend); // mov eax, OnSend
     emit({0xFF, 0xD0});                   // call eax
     emit({0x83, 0xC4, 0x08});             // add esp, 8
-    emit({0x61});                         // popad
+    emit({0x85, 0xC0});                   // test eax, eax
+    // jnz block_path (offset filled below)
+    uint8_t* jnzPatch = p;
+    emit({0x75, 0x00});                   // jnz +?? (patched)
 
-    // Resume: push <funcStart+RESUME_OFF>; ret  (leaves eax/esi intact).
+    // --- pass-through path ---
+    emit({0x61});                         // popad
     uintptr_t resume = (uintptr_t)(hookPoint - PROLOGUE_LEN) + RESUME_OFF;
     emit({0x68}); emit32((uint32_t)resume); // push resume
     emit({0xC3});                           // ret
+
+    // --- block path: skip the original send, return 1 ---
+    uint8_t* blockAddr = p;
+    jnzPatch[1] = (uint8_t)(blockAddr - (jnzPatch + 2)); // patch jnz offset
+    emit({0x61});                         // popad
+    emit({0x83, 0xC4, 0x1C});             // add esp, 1Ch (undo stolen sub esp)
+    emit({0xB8}); emit32(1);              // mov eax, 1 (return success)
+    emit({0x5B});                         // pop ebx
+    emit({0x5E});                         // pop esi
+    emit({0x5F});                         // pop edi
+    emit({0x5D});                         // pop ebp
+    emit({0xC3});                         // ret
     return true;
 }
 
@@ -201,6 +238,7 @@ bool Install(uintptr_t steamclientBase, size_t steamclientSize) {
     LOG("[GamesPlayed] CCMInterface::Send found at %p (sc+0x%zx)",
         funcStart, (size_t)((uintptr_t)funcStart - steamclientBase));
 
+    g_funcStart = funcStart;
     g_hookPoint = funcStart + PROLOGUE_LEN;
 
     if (!BuildTrampoline(g_hookPoint)) {
@@ -241,5 +279,9 @@ void Remove() {
 
     g_installed.store(false, std::memory_order_release);
 }
+
+// Resolved CCMInterface::Send entry. Valid after Install(); other modules reuse
+// this instead of re-scanning, since the detour clobbers the post-prologue bytes.
+void* GetSendFunc() { return g_funcStart; }
 
 } // namespace GamesPlayedHook

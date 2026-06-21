@@ -160,6 +160,16 @@ GoogleDriveProvider::LookupStatus GoogleDriveProvider::FindDriveFolderStatus(
         InvalidateFolderChild(parentId, name);
         return LookupStatus::Missing;
     }
+    if (files.size() > 1) {
+        LOG("[GDrive] FindDriveFolderStatus '%s' parent=%s: found %zu results (T%zu)",
+            name.c_str(), parentId.c_str(), files.size(),
+            std::hash<std::thread::id>{}(std::this_thread::get_id()) % 10000);
+        for (size_t i = 0; i < files.size(); ++i) {
+            LOG("[GDrive]   [%zu] id=%s created=%s", i,
+                files[i]["id"].str().c_str(),
+                files[i]["createdTime"].str().c_str());
+        }
+    }
     // Keep the oldest folder (first by createdTime ascending)
     std::string keepId = files[(size_t)0]["id"].str();
     // clean up duplicate folders (can happen from eventual consistency)
@@ -286,12 +296,17 @@ std::string GoogleDriveProvider::CreateDriveFolder(const std::string& name,
         arr.arrVal.push_back(Json::String(parentId));
         meta.objVal["parents"] = std::move(arr);
     }
+    LOG("[GDrive] CreateFolder '%s' under parent=%s (T%zu)",
+        name.c_str(), parentId.empty() ? "root" : parentId.c_str(),
+        std::hash<std::thread::id>{}(std::this_thread::get_id()) % 10000);
     auto r = ApiRequest("POST", "/drive/v3/files?fields=id", Json::Stringify(meta));
     if (r.status < 200 || r.status >= 300) {
         LOG("[GDrive] CreateFolder '%s' failed: HTTP %d", name.c_str(), r.status);
         return {};
     }
-    return Json::Parse(r.body)["id"].str();
+    auto id = Json::Parse(r.body)["id"].str();
+    LOG("[GDrive] CreateFolder '%s' -> %s (HTTP %d)", name.c_str(), id.c_str(), r.status);
+    return id;
 }
 
 std::string GoogleDriveProvider::GetRootFolder() {
@@ -398,9 +413,8 @@ GoogleDriveProvider::LookupStatus GoogleDriveProvider::ResolveSubfolders(
         return LookupStatus::Exists;
     }
 
-    // Only hold the creation mutex during CreateDriveFolder calls.
-    // FindDriveFolder (network I/O) runs unlocked so other threads
-    // can look up already-existing folders concurrently.
+    // Hold the creation mutex only during CreateDriveFolder; FindDriveFolder (network
+    // I/O) runs unlocked so threads can resolve existing folders concurrently.
     std::unique_lock<std::recursive_mutex> createLock(m_folderCreateMtx, std::defer_lock);
 
     std::string current = parentId;
@@ -425,9 +439,8 @@ GoogleDriveProvider::LookupStatus GoogleDriveProvider::ResolveSubfolders(
             std::string id = FindDriveFolder(seg, current);
             if (id.empty()) {
                 if (!create) return LookupStatus::Missing;
-                // Only hold creation mutex for the actual folder creation
                 if (!createLock.owns_lock()) createLock.lock();
-                // Double-check cache after acquiring the creation lock
+                // Re-check cache after acquiring the creation lock.
                 {
                     std::lock_guard<std::recursive_mutex> lock(m_folderMtx);
                     auto it = m_folders.find(cacheKey);
@@ -773,18 +786,27 @@ GoogleDriveProvider::UploadStatus GoogleDriveProvider::UploadOrUpdate(
         std::string("Content-Type: multipart/related; boundary=") + boundary};
 
     HttpResp r;
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    for (int attempt = 0; attempt < 5; ++attempt) {
         if (attempt > 0) {
-            std::this_thread::sleep_for(std::chrono::seconds(attempt));
+            int baseMs = 1000 * (1 << (attempt - 1)); // 1s, 2s, 4s, 8s
+            int jitter = std::uniform_int_distribution<int>(0, baseMs / 2)(rng);
+            int delayMs = baseMs + jitter;
+            LOG("[GDrive] Upload backoff attempt %d, waiting %dms", attempt + 1, delayMs);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
             token = GetAccessToken();
             if (token.empty()) return UploadStatus::Error;
             uploadHdrs[0] = "Authorization: Bearer " + token;
         }
         ThrottleApiCall();
         r = Request(method, "www.googleapis.com", path, body, uploadHdrs);
-        if (!IsRateLimited(r.status, r.body)) break;
-        LOG("[GDrive] Rate limited (upload attempt %d), backing off %ds",
-            attempt + 1, attempt + 1);
+        bool rateLimited = IsRateLimited(r.status, r.body);
+        bool timedOut = (r.status == 0);
+        if (!rateLimited && !timedOut) break;
+        if (rateLimited)
+            g_rateLimitHits.fetch_add(1, std::memory_order_relaxed);
+        LOG("[GDrive] Upload %s (attempt %d, HTTP %d)",
+            rateLimited ? "rate limited" : "timeout", attempt + 1, r.status);
     }
 
     if (r.status == 404 && !existingId.empty()) {
@@ -806,6 +828,10 @@ GoogleDriveProvider::UploadStatus GoogleDriveProvider::UploadOrUpdate(
 
 bool GoogleDriveProvider::DeleteById(const std::string& fileId) {
     auto r = ApiRequest("DELETE", "/drive/v3/files/" + fileId, "", "");
+    if (r.status < 200 || r.status >= 300) {
+        LOG("[GDrive] DeleteById %s: HTTP %d body=%s",
+            fileId.c_str(), r.status, r.body.substr(0, 200).c_str());
+    }
     return r.status >= 200 && r.status < 300;
 }
 
@@ -930,7 +956,11 @@ bool GoogleDriveProvider::UploadBatch(const std::vector<UploadItem>& items) {
     uint64_t rlBefore = g_rateLimitHits.load(std::memory_order_relaxed);
 
     static constexpr size_t kMaxParallel = 10;                 // native @nClientCloudMaxNumParallelUploads
-    static constexpr uint64_t kMaxBytesInFlight = 64ull << 20; // native @nClientCloudMaxMBParallelUploads (64 MB)
+    // Lower than native's 64MB: Drive throttles per connection, so capping in-flight
+    // bytes keeps each blob above the request receive timeout on a home uplink.
+    // Runtime-configurable (config.json "upload_inflight_mb"); default 24 MB.
+    const uint64_t kMaxBytesInFlight =
+        g_uploadInFlightCapBytes.load(std::memory_order_relaxed);
 
     std::atomic<size_t> next{0};
     std::atomic<bool> failed{false};

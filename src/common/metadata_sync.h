@@ -8,21 +8,14 @@ extern std::atomic<bool> steamToolsPresent;
 extern std::atomic<bool> syncLuas;
 
 // Native stats/playtime sync gates (config: sync_achievements / sync_playtime).
-// When false, the corresponding native path does NOT interfere at all: stats
-// pass straight through to Steam's real server (no import/synthesize), and
-// playtime is neither tracked nor merged. Default true (sync enabled).
 extern std::atomic<bool> syncAchievements;
 extern std::atomic<bool> syncPlaytime;
 
-// Experimental: proactively fetch missing achievement/stats schemas from the CM
-// (config: experimental_schema_fetch). When false, no schema requests are sent.
-// Default false (opt-in experimental feature).
+// Fetch missing achievement/stats schemas from the CM (config: schema_fetch).
 extern std::atomic<bool> schemaFetch;
 
-// UNSUPPORTED WIP OVERRIDE NON-ST CLIENT GATE.
-// Metadata features (achievements, playtime, schema fetch, non-Steam-game spoof)
-// are hard-gated to SteamTools clients. config override_non_st_client_gate lifts
-// the gate so a non-ST client honors the per-feature flags. Default false.
+// Lifts the SteamTools-client gate on metadata features (config
+// override_non_st_client_gate). Default false.
 extern std::atomic<bool> overrideNonStGate;
 
 inline bool IsEnabled() {
@@ -30,15 +23,17 @@ inline bool IsEnabled() {
            syncLuas.load(std::memory_order_relaxed);
 }
 
-// True when the ST-gate is open: either a SteamTools client, or the unsupported
-// override is set. Metadata features must AND their per-feature flag with this.
+// The SteamTools-client gate. Windows-only; Linux always runs under SLSsteam.
 inline bool StGateOpen() {
+#if defined(__linux__)
+    return true;
+#else
     return steamToolsPresent.load(std::memory_order_relaxed) ||
            overrideNonStGate.load(std::memory_order_relaxed);
+#endif
 }
 
-// Per-feature flag AND'd with the ST-gate. Use these everywhere instead of the raw
-// flags so a missed call site can't bypass the gate.
+// Per-feature flag AND'd with the ST-gate.
 inline bool AchievementsEnabled() {
     return syncAchievements.load(std::memory_order_relaxed) && StGateOpen();
 }

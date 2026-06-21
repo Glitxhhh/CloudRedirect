@@ -51,16 +51,10 @@ bool PromoteStagedBatchForCommit(uint32_t accountId, uint32_t appId,
 // Verifies every file in `state` has its CAS blob durably on the provider before
 // its manifest is published; heals from the local cache or drops phantom entries.
 // Returns false only when the cloud blob listing is unavailable (don't publish).
-//
-// `confirmedDurable`, when non-null, lists filenames whose blobs were just uploaded
-// (and provider-confirmed with a 2xx) in this batch. These are durable by definition
-// -- exactly the signal native trusts (the upload EResult; see YldUploadFiles) -- so
-// they need no re-listing. If every file in `state` is confirmed, the (slow, ~20s for
-// GDrive) blob listing is skipped entirely; otherwise it lists only to verify the
-// carried-forward remainder (files from a prior CN that this batch did not re-upload).
+// Files whose SHA is in the session durable cache (RecordDurableBlobShas) are
+// trusted without re-listing -- the session lock prevents GC by other machines.
 bool VerifyAndHealManifestForPublish(uint32_t accountId, uint32_t appId,
-                                     CloudAppState& state,
-                                     const std::unordered_set<std::string>* confirmedDurable = nullptr);
+                                     CloudAppState& state);
 
 std::vector<uint64_t> ListStagedBatchIds(uint32_t accountId, uint32_t appId);
 bool RemoveStagedBatch(uint32_t accountId, uint32_t appId, uint64_t batchId);

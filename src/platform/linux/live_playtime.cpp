@@ -181,6 +181,123 @@ static bool BuildTrampoline(uint8_t* hookPoint) {
     return true;
 }
 
+// Resolve vtable and descriptor from RTTI + code analysis (survives Steam updates).
+// 1. Find RTTI typestring for CProtoBufMsg<...Response> in .rodata
+// 2. Scan .data.rel.ro for typeinfo (ptr to typestring at offset +4)
+// 3. Scan .data.rel.ro for vtable header ({0, typeinfo_ptr}) -> vptr = header + 8
+// 4. Find wrapper function that stores the vptr, extract descriptor from wrapper[1] store
+static bool ResolveVtableAndDescriptor(uintptr_t base, size_t size) {
+    // Step 1: find the RTTI name string
+    static const char kRttiName[] = "12CProtoBufMsgI35CPlayer_GetLastPlayedTimes_ResponseE";
+    const uint8_t* s = (const uint8_t*)base;
+    const uint8_t* end = s + size - sizeof(kRttiName);
+    uintptr_t nameAddr = 0;
+    for (const uint8_t* p = s; p <= end; ++p) {
+        if (memcmp(p, kRttiName, sizeof(kRttiName) - 1) == 0) {
+            nameAddr = (uintptr_t)p;
+            break;
+        }
+    }
+    if (!nameAddr) {
+        LOG("[Stats] LivePlaytime: RTTI name string not found");
+        return false;
+    }
+
+    // Step 2: find typeinfo (scan for 4-byte pointer to nameAddr)
+    uintptr_t tiAddr = 0;
+    uint32_t nameVal = (uint32_t)nameAddr;
+    for (const uint8_t* p = s; p <= end - 3; p += 4) {
+        if (*(const uint32_t*)p == nameVal) {
+            tiAddr = (uintptr_t)p - 4; // typeinfo = { vptr_to_typeinfo_class, name_ptr }
+            break;
+        }
+    }
+    if (!tiAddr) {
+        LOG("[Stats] LivePlaytime: typeinfo not found for RTTI name at %p", (void*)nameAddr);
+        return false;
+    }
+
+    // Step 3: find vtable header ({offset_to_top=0, typeinfo_ptr=tiAddr})
+    uint32_t tiVal = (uint32_t)tiAddr;
+    uintptr_t vptr = 0;
+    for (const uint8_t* p = s + 4; p <= end - 3; p += 4) {
+        if (*(const uint32_t*)p == tiVal && *(const uint32_t*)(p - 4) == 0) {
+            vptr = (uintptr_t)p + 4; // skip past typeinfo_ptr -> first vfunc slot
+            break;
+        }
+    }
+    if (!vptr) {
+        LOG("[Stats] LivePlaytime: vtable not found for typeinfo at %p", (void*)tiAddr);
+        return false;
+    }
+    g_respWrapperVt = vptr;
+    LOG("[Stats] LivePlaytime: RTTI-resolved vptr=%p (typeinfo=%p)", (void*)vptr, (void*)tiAddr);
+
+    // Step 4: find descriptor pointer. The CProtoBufMsg wrapper stores
+    // [0]=wrapper_vptr, [1]=&raw_response_vptr. Resolve the raw Response class's
+    // vptr from its RTTI, then scan .data.rel.ro for a pointer to it.
+    static const char kRawRttiName[] = "35CPlayer_GetLastPlayedTimes_Response";
+    uintptr_t rawNameAddr = 0;
+    for (const uint8_t* p = s; p <= end - sizeof(kRawRttiName); ++p) {
+        if (memcmp(p, kRawRttiName, sizeof(kRawRttiName) - 1) == 0) {
+            // Distinguish from the CProtoBufMsg wrapper's RTTI
+            if (p > s && *(p - 1) == 'I') continue; // "...I35CPlayer..." is the wrapper
+            rawNameAddr = (uintptr_t)p;
+            break;
+        }
+    }
+    if (!rawNameAddr) {
+        LOG("[Stats] LivePlaytime: raw Response RTTI name not found");
+        return false;
+    }
+
+    // Find raw typeinfo (pointer to rawNameAddr at offset +4 of typeinfo)
+    uint32_t rawNameVal = (uint32_t)rawNameAddr;
+    uintptr_t rawTiAddr = 0;
+    for (const uint8_t* p = s; p <= end - 3; p += 4) {
+        if (*(const uint32_t*)p == rawNameVal) {
+            rawTiAddr = (uintptr_t)p - 4;
+            break;
+        }
+    }
+    if (!rawTiAddr) {
+        LOG("[Stats] LivePlaytime: raw Response typeinfo not found");
+        return false;
+    }
+
+    // Find raw vtable header ({0, rawTiAddr}) -> raw vptr = header + 8
+    uint32_t rawTiVal = (uint32_t)rawTiAddr;
+    uintptr_t rawVptr = 0;
+    for (const uint8_t* p = s + 4; p <= end - 3; p += 4) {
+        if (*(const uint32_t*)p == rawTiVal && *(const uint32_t*)(p - 4) == 0) {
+            rawVptr = (uintptr_t)p + 4;
+            break;
+        }
+    }
+    if (!rawVptr) {
+        LOG("[Stats] LivePlaytime: raw Response vtable not found");
+        return false;
+    }
+
+    // Descriptor = pointer in .data.rel.ro whose value is rawVptr
+    uint32_t rawVptrVal = (uint32_t)rawVptr;
+    uintptr_t descAddr = 0;
+    for (const uint8_t* p = s; p <= end - 3; p += 4) {
+        if (*(const uint32_t*)p == rawVptrVal && (uintptr_t)p != (rawVptr - 8 + 4)) {
+            // Skip the vtable header itself (which also contains rawVptr-8's neighborhood)
+            descAddr = (uintptr_t)p;
+            break;
+        }
+    }
+    if (!descAddr) {
+        LOG("[Stats] LivePlaytime: descriptor pointer not found for raw vptr %p", (void*)rawVptr);
+        return false;
+    }
+    g_respDescriptor = descAddr;
+    LOG("[Stats] LivePlaytime: RTTI-resolved descriptor=%p (rawVptr=%p)", (void*)descAddr, (void*)rawVptr);
+    return true;
+}
+
 bool Resolve(uintptr_t base, size_t size, ParseFromArrayFn parse) {
     g_base = base;
     g_parseFromArray = parse;
@@ -200,8 +317,11 @@ bool Resolve(uintptr_t base, size_t size, ParseFromArrayFn parse) {
     g_msgCtor = (MsgCtorFn)ctor;
     g_msgInit = (MsgInitFn)init;
     g_msgDtor = (MsgDtorFn)dtor;
-    g_respWrapperVt  = base + 0x2E15B4C;
-    g_respDescriptor = base + 0x2EA3FFC;
+
+    if (!ResolveVtableAndDescriptor(base, size)) {
+        LOG("[Stats] LivePlaytime: vtable/descriptor resolution failed -- live UI updates disabled");
+        return false;
+    }
 
     LOG("[Stats] LivePlaytime resolved: writer=%p ctor=%p init=%p dtor=%p",
         writer, ctor, init, dtor);

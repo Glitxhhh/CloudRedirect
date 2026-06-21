@@ -229,11 +229,28 @@ std::optional<std::vector<uint8_t>> HandleLegacyGetUserStats(
     resp.WriteVarint(2, 1);                 // eresult = OK
     resp.WriteVarint(3, stats.crcStats);    // crc_stats
 
-    // schema (field 4) - send if client CRC differs
+    // schema (field 4): send when CRC differs OR the client has no schema yet
+    // (clientCrc==0 / schemaVersion==-1); CRC-only would withhold it in the empty-store case.
     bool sentSchema = false;
-    if (clientCrc != stats.crcStats && !stats.schema.empty()) {
+    if (!stats.schema.empty() &&
+        (clientCrc != stats.crcStats || clientCrc == 0 || schemaVersion == -1)) {
         resp.WriteBytes(4, stats.schema.data(), stats.schema.size());
         sentSchema = true;
+    }
+
+    // OR each achievement block's `bits` into the matching stat value; MergeAchievements
+    // updates bits without touching stats[].value (the "9 served, 8 displayed" bug).
+    for (auto& a : stats.achievements) {
+        for (auto& s : stats.stats) {
+            if (s.statId == a.statId) {
+                if ((s.value | a.bits) != s.value) {
+                    LOG("[Stats]   Reconcile stat %u: val 0x%X -> 0x%X (synced from ach bits)",
+                        s.statId, s.value, s.value | a.bits);
+                    s.value |= a.bits;
+                }
+                break;
+            }
+        }
     }
 
     // stats (field 5, repeated submessage): stat_id(1), stat_value(2)
@@ -282,8 +299,8 @@ std::optional<std::vector<uint8_t>> HandleLegacyStoreUserStats2(
     auto* f5 = PB::FindField(fields, 5);
     if (f5) explicitReset = (f5->varintVal != 0);
 
-    LOG("[Stats] Legacy StoreUserStats2 app=%u gameId=%llu reset=%d",
-        appId, (unsigned long long)gameId, explicitReset);
+    LOG("[Stats] Legacy StoreUserStats2 app=%u gameId=%llu reset=%d ns=%d",
+        appId, (unsigned long long)gameId, explicitReset, IsNamespaceApp(appId) ? 1 : 0);
 
     if (explicitReset) {
         StatsStore::ResetStats(appId);   // clears stats/achievements under the store lock
@@ -365,10 +382,7 @@ void ObserveGamesPlayed(const uint8_t* body, size_t bodyLen) {
 // unlock. The body has no timestamps, but Steam writes them to the native blob in
 // the same store job, so re-read the blob here to sync the new unlocks.
 void ObserveStoreUserStats(const uint8_t* body, size_t bodyLen) {
-    // Raw flag only -- this is SHARED (Windows+Linux) code. The ST-gate
-    // (AchievementsEnabled / StGateOpen) is applied by the WINDOWS callers at
-    // their hook sites; baking it in here would force Linux OFF since
-    // steamToolsPresent is structurally always-false on Linux.
+    // Raw flag only: shared code; Windows callers apply the ST-gate at their hook sites.
     if (!MetadataSync::syncAchievements.load(std::memory_order_relaxed)) return;
 
     auto fields = PB::Parse(body, bodyLen);

@@ -70,37 +70,64 @@ inline int64_t NowMs() {
 // can acquire. BeginBatch's FetchCloudStateForServe also drains it so the next batch
 // sees the fresh cloud CN.
 namespace {
+struct PendingPublishEntry {
+    uint64_t generation = 0;
+    std::shared_future<void> fut;
+};
 std::mutex& g_pendingPublishMtx = *new std::mutex();
-std::unordered_map<uint64_t, std::shared_future<void>>& g_pendingPublish =
-    *new std::unordered_map<uint64_t, std::shared_future<void>>();
+std::unordered_map<uint64_t, PendingPublishEntry>& g_pendingPublish =
+    *new std::unordered_map<uint64_t, PendingPublishEntry>();
+uint64_t g_pendingPublishGen = 0;
 } // namespace
 
 void SetPendingPublish(uint32_t accountId, uint32_t appId,
                        std::shared_future<void> fut) {
     std::lock_guard<std::mutex> lk(g_pendingPublishMtx);
-    g_pendingPublish[ServeCacheKey(accountId, appId)] = std::move(fut);
+    PendingPublishEntry entry;
+    entry.generation = ++g_pendingPublishGen;
+    entry.fut = std::move(fut);
+    g_pendingPublish[ServeCacheKey(accountId, appId)] = std::move(entry);
 }
 
 void WaitForPendingPublish(uint32_t accountId, uint32_t appId) {
-    std::shared_future<void> fut;
-    {
-        std::lock_guard<std::mutex> lk(g_pendingPublishMtx);
-        auto it = g_pendingPublish.find(ServeCacheKey(accountId, appId));
-        if (it == g_pendingPublish.end()) return;
-        fut = it->second;
-    }
-    if (fut.valid()) {
-        // Runs on BMainLoop (BeginBatch handler); a hard fut.wait() here starved the
-        // frame watchdog while a prior batch's publish held its barrier. Pump the job
-        // coroutine instead, polling with wait_for(0). Degrades to a plain spin off Steam.
-        CoopYield::PumpUntil([&fut]() {
-            return fut.wait_for(std::chrono::seconds(0)) ==
-                   std::future_status::ready;
-        });
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_pendingPublishMtx);
-        g_pendingPublish.erase(ServeCacheKey(accountId, appId));
+    const uint64_t key = ServeCacheKey(accountId, appId);
+    // Loop: PumpUntil yields the job coroutine, so another CompleteBatch for this
+    // same app can run while we wait and replace the map entry with a newer barrier.
+    // We must wait on (and only erase) the exact future we observed -- never blindly
+    // erase, or we'd drop a newer publish barrier and release the session lock while
+    // that publish is still in flight (stale cloud state for the next machine).
+    while (true) {
+        std::shared_future<void> fut;
+        uint64_t gen = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_pendingPublishMtx);
+            auto it = g_pendingPublish.find(key);
+            if (it == g_pendingPublish.end()) return;
+            fut = it->second.fut;
+            gen = it->second.generation;
+        }
+        if (fut.valid()) {
+            // Runs on BMainLoop (BeginBatch handler); a hard fut.wait() here starved the
+            // frame watchdog while a prior batch's publish held its barrier. Pump the job
+            // coroutine instead, polling with wait_for(0). Degrades to a plain spin off Steam.
+            CoopYield::PumpUntil([&fut]() {
+                return fut.wait_for(std::chrono::seconds(0)) ==
+                       std::future_status::ready;
+            });
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_pendingPublishMtx);
+            auto it = g_pendingPublish.find(key);
+            // Only erase if the map still holds the same barrier we just waited on.
+            // A newer CompleteBatch that ran during our yield will have bumped the
+            // generation; loop again to wait on that one before returning.
+            if (it == g_pendingPublish.end()) return;
+            if (it->second.generation != gen) {
+                continue;  // a newer barrier appeared; wait on it too
+            }
+            g_pendingPublish.erase(it);
+            return;
+        }
     }
 }
 
@@ -310,7 +337,10 @@ bool DeserializeState(const std::string& json, CloudAppState& outState) {
 static constexpr const char* kStateFilename = "state.cloudredirect";
 static constexpr size_t MAX_STATE_SIZE = 16 * 1024 * 1024; // 16 MB
 
-static StateFetchResult FetchCloudStateLive(uint32_t accountId, uint32_t appId) {
+// allowLegacyMigration=false reads canonical state without migration side effects;
+// used by PublishCloudState's CN-regression re-check to avoid recursive migration.
+static StateFetchResult FetchCloudStateLive(uint32_t accountId, uint32_t appId,
+                                            bool allowLegacyMigration = true) {
     InflightSyncScope guard;
     if (!guard) return { StateFetchStatus::FetchFailed, {} };
     if (!g_stateProvider || !g_stateProvider->IsAuthenticated())
@@ -339,6 +369,12 @@ static StateFetchResult FetchCloudStateLive(uint32_t accountId, uint32_t appId) 
 
     auto existsStatus = g_stateProvider->CheckExists(statePath);
     if (existsStatus == ICloudProvider::ExistsStatus::Missing) {
+        // No canonical state: nothing to migrate from when the caller forbids it
+        // (e.g. PublishCloudState's regression re-check). Absent state means there
+        // is no newer cloud CN to regress against, so report NotFound.
+        if (!allowLegacyMigration) {
+            return { StateFetchStatus::NotFound, {} };
+        }
         auto legacyResult = FetchCloudManifest(accountId, appId);
         uint64_t legacyCN = 0;
 
@@ -444,8 +480,10 @@ static std::unordered_set<uint64_t>& g_boundedInflightKeys =
     *new std::unordered_set<uint64_t>();                     // apps with a live worker
 static std::atomic<int> g_boundedWorkerCount{0};
 static std::atomic<int64_t> g_providerSlowUntilMs{0};       // circuit-breaker deadline
+static std::atomic<int> g_consecutiveTimeouts{0};           // reset on any successful fetch
 static constexpr int kMaxBoundedWorkers = 4;
-static constexpr int kCircuitCooldownMs = 30000;            // serve-local window after a timeout
+static constexpr int kCircuitCooldownMs = 8000;             // serve-local window once circuit opens
+static constexpr int kCircuitTripThreshold = 2;             // consecutive timeouts before opening
 
 StateFetchResult FetchCloudStateBounded(uint32_t accountId, uint32_t appId,
                                         int deadlineMs) {
@@ -496,14 +534,23 @@ StateFetchResult FetchCloudStateBounded(uint32_t accountId, uint32_t appId,
 
     if (future.wait_for(std::chrono::milliseconds(deadlineMs)) ==
         std::future_status::ready) {
-        return future.get();
+        StateFetchResult r = future.get();
+        if (r.status == StateFetchStatus::Ok || r.status == StateFetchStatus::NotFound)
+            g_consecutiveTimeouts.store(0, std::memory_order_relaxed);
+        return r;
     }
-    // Timed out: open the circuit so the rest of this changelist burst serves local
-    // immediately instead of each waiting another full deadline.
-    g_providerSlowUntilMs.store(NowMs() + kCircuitCooldownMs, std::memory_order_relaxed);
-    LOG("[AppState] FetchCloudStateBounded app %u: provider exceeded %dms -- serving "
-        "local, circuit open %dms, background fetch continues",
-        appId, deadlineMs, kCircuitCooldownMs);
+    // Timed out. Open the circuit only after repeated timeouts so a single slow cold
+    // fetch doesn't blind the whole burst; one timeout is safe (caller serves local
+    // as a delta) but the background fetch still warms the cache for the next call.
+    if (g_consecutiveTimeouts.fetch_add(1, std::memory_order_relaxed) + 1 >= kCircuitTripThreshold) {
+        g_providerSlowUntilMs.store(NowMs() + kCircuitCooldownMs, std::memory_order_relaxed);
+        LOG("[AppState] FetchCloudStateBounded app %u: provider exceeded %dms (%d consecutive) "
+            "-- circuit open %dms, background fetch continues",
+            appId, deadlineMs, kCircuitTripThreshold, kCircuitCooldownMs);
+    } else {
+        LOG("[AppState] FetchCloudStateBounded app %u: provider exceeded %dms -- serving local "
+            "this call, circuit NOT yet open, background fetch continues", appId, deadlineMs);
+    }
     return { StateFetchStatus::Timeout, {} };
 }
 
@@ -530,8 +577,7 @@ StateFetchResult FetchCloudStateForServe(uint32_t accountId, uint32_t appId) {
 }
 
 bool PublishCloudState(uint32_t accountId, uint32_t appId,
-                       const CloudAppState& state, bool lockOnly,
-                       const std::unordered_set<std::string>* confirmedDurable) {
+                       const CloudAppState& state, bool lockOnly) {
     InflightSyncScope guard;
     if (!guard) return false;
     if (!g_stateProvider || !g_stateProvider->IsAuthenticated()) {
@@ -544,7 +590,7 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
     // it: a session-release publish reuses the manifest CompleteBatch just verified.
     CloudAppState verified = state;
     if (!lockOnly &&
-        !VerifyAndHealManifestForPublish(accountId, appId, verified, confirmedDurable)) {
+        !VerifyAndHealManifestForPublish(accountId, appId, verified)) {
         LOG("[AppState] PublishCloudState app %u: cannot verify blobs, deferring publish", appId);
         return false;
     }
@@ -553,12 +599,23 @@ bool PublishCloudState(uint32_t accountId, uint32_t appId,
     // cloud CN and reject a stale RMW (e.g. the session lock republish) that would
     // clobber a newer CN another machine published in the window. Equal CN is fine.
     {
-        auto current = FetchCloudStateLive(accountId, appId);
+        auto current = FetchCloudStateLive(accountId, appId,
+                                           /*allowLegacyMigration=*/false);
         if (current.status == StateFetchStatus::Ok && current.state.cn > verified.cn) {
             LOG("[AppState] PublishCloudState app %u: REFUSED -- cloud CN=%llu is newer than "
                 "publish CN=%llu (would regress changelist); leaving cloud state intact",
                 appId, (unsigned long long)current.state.cn,
                 (unsigned long long)verified.cn);
+            return false;
+        }
+        // Fail-closed: an inconclusive re-fetch can't prove we won't regress a newer
+        // cloud CN. NotFound is genuinely empty (fresh app) so publishing is safe;
+        // Timeout/FetchFailed/ParseFailed are not -- refuse so the caller retries.
+        if (current.status != StateFetchStatus::Ok &&
+            current.status != StateFetchStatus::NotFound) {
+            LOG("[AppState] PublishCloudState app %u: REFUSED -- cannot verify cloud CN "
+                "(status=%d); deferring publish to avoid a blind regression",
+                appId, static_cast<int>(current.status));
             return false;
         }
     }

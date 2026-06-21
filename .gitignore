@@ -1,5 +1,6 @@
 build/
 build-*/
+dist/
 ui/bin/
 ui/obj/
 ui/publish/

@@ -32,9 +32,18 @@ void SetCloudProvider(CloudPullAllFn pullAll, CloudPushAllFn pushAll,
                       CloudPullLegacyFn pullLegacy = nullptr,
                       CloudPullLegacyPlaytimeFn pullLegacyPlaytime = nullptr);
 
+// Merge strategies for stat values (mirrors Steam's resolution_method + type_int).
+enum class StatMerge : uint8_t {
+    Overwrite  = 0,  // last-writer-wins (resolution_method=3 or unknown)
+    BitwiseOr  = 1,  // type_int=4 (achievements) or resolution_method=1
+    MaxInt     = 2,  // resolution_method=2, type_int=1 (signed int max)
+    MaxFloat   = 3,  // resolution_method=2, type_int=2/3 (float max)
+};
+
 struct StatEntry {
     uint32_t statId;
     uint32_t value;
+    StatMerge merge = StatMerge::Overwrite;
 };
 
 struct AchievementUnlock {
@@ -108,6 +117,18 @@ void SetNamespacePredicate(NamespacePredicate pred);
 // GetLastPlayedTimes has data before launch. Requires a logged-in accountId.
 void SeedApps(const std::vector<uint32_t>& appIds);
 
+// Retry native imports for namespace apps with an on-disk schema that the
+// boot-time sweep skipped (accountId not yet known). Flags dirty, no push.
+void RetryNativeImportsAfterLogin();
+
+// Clear per-account in-memory caches on a Steam account switch so one account's
+// stats don't leak into the next. No push. Returns true if state was cleared.
+bool ResetForAccountSwitch(uint32_t newAccountId);
+
+// Test-only: reset all per-account state plus the last-seen account id so tests
+// start clean regardless of order. Never call from production.
+void ResetForTesting();
+
 // Re-pull + merge each app's cloud blob; returns apps whose playtime advanced
 // (another device played) for a live notification. Runs in the background.
 std::vector<uint32_t> RefreshFromCloud(const std::vector<uint32_t>& appIds);
@@ -146,10 +167,8 @@ uint32_t SetAchievement(uint32_t appId, uint32_t statId, uint32_t bit, uint32_t 
 void SetSchema(uint32_t appId, const uint8_t* data, size_t len);
 const std::vector<uint8_t>& GetSchema(uint32_t appId);
 
-// Re-read Steam's native blob for an app and merge any newly unlocked
-// achievements / updated stat values into the store, then push to the cloud if
-// anything changed. Called when an achievement-store message is observed on the
-// wire (the genuine unlock event). Safe to call from the network thread.
+// Re-read Steam's native blob, merge new unlocks/stat values, push if changed.
+// Called when an achievement-store message is seen on the wire.
 void CaptureNativeUnlocks(uint32_t appId);
 
 // Playtime tracking
@@ -162,5 +181,10 @@ std::vector<uint32_t> GetTrackedApps();
 
 // Flush all dirty apps to disk.
 void FlushAll();
+
+// Merge two app-stats JSON docs (same app): monotonic playtime, union
+// achievements, stat-value merge. Returns merged JSON; prefers incoming on parse
+// failure. Used by the push layer to avoid clobbering another device's upload.
+std::string MergeAppStatsJson(const std::string& base, const std::string& incoming);
 
 } // namespace StatsStore

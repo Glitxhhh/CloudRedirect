@@ -1,6 +1,8 @@
 #include "achievement_inject.h"
+#include "metadata_sync.h"
 #include "stats_handlers.h"
 #include "cloud_intercept.h"
+#include "steam_kv_injector.h"
 #include "protobuf.h"
 #include "log.h"
 
@@ -10,6 +12,7 @@
 #include <csignal>
 #include <mutex>
 #include <queue>
+#include <vector>
 #include <unistd.h>
 
 namespace AchievementInject {
@@ -25,8 +28,8 @@ using BRouteMsgFn     = char(*)(int jobMgr, int connCtx, void* wrappedPkt, void*
 
 static constexpr uintptr_t RVA_WRAP_PACKET = 0x2AC1EC0;
 static constexpr uintptr_t RVA_BROUTE      = 0x2A6A1E0;
-static constexpr uintptr_t RVA_ENGINE_GLOBAL = 0x2ECDB40;
-static constexpr uintptr_t RVA_JOBCUR_GLOBAL = 0x2F00A60;  // g_pJobCur (current job)
+static constexpr uintptr_t RVA_ENGINE_GLOBAL = 0x2ED1BC0;  // resolved dynamically via KvInjector
+static constexpr uintptr_t RVA_JOBCUR_GLOBAL = 0x2F04C20;  // g_pJobCur (current job)
 static constexpr uint32_t  ENGINE_OFF_JOBMGR = 0x1B8;   // jobMgr = *engine + 0x1B8
 static constexpr uint32_t  CCM_OFF_CONNCTX   = 1404;    // connCtx = *(cmInterface+1404)
 static constexpr uint32_t  JOB_OFF_JOBID     = 16;      // CJob+16 = jobid (CJob ctor sub_2A5A170)
@@ -92,11 +95,14 @@ private:
     struct sigaction m_bus = {};
 };
 
-// One pending 819 response: the 818's jobid + the app + the captured cmInterface.
+// One pending 819 response: the 818's jobid + the app + the captured cmInterface
+// + the prebuilt 819 body. The body is built in ObserveOutbound so we only block
+// the outbound 818 when we can actually serve a reply.
 struct Pending {
     uint64_t jobIdTarget;
     uint32_t appId;
     void*    cmInterface;
+    std::vector<uint8_t> body;
 };
 static std::queue<Pending> g_queue;
 static std::mutex g_queueMutex;
@@ -119,8 +125,8 @@ bool Resolve(uintptr_t base, size_t size, SerializeBodyFn serialize) {
 
 bool Ready() { return g_wrapPacket && g_bRoute && g_base && g_serializeBody; }
 
-void ObserveOutbound(uint32_t emsg, void* msgObj, void* cmInterface) {
-    if (!Ready() || emsg != EMSG_GET_USER_STATS || !msgObj || !cmInterface) return;
+int ObserveOutbound(uint32_t emsg, void* msgObj, void* cmInterface) {
+    if (!Ready() || emsg != EMSG_GET_USER_STATS || !msgObj || !cmInterface) return 0;
 
     uint64_t jobId = 0;
     void* bodyObj = nullptr;
@@ -129,28 +135,43 @@ void ObserveOutbound(uint32_t emsg, void* msgObj, void* cmInterface) {
         // Read it from the sending coroutine instead: g_pJobCur is the
         // CAPIJobRequestUserStats, jobid at CJob+16 (ctor sub_2A5A170).
         CallGuard guard;
-        if (sigsetjmp(g_jmp, 1) != 0) return;
+        if (sigsetjmp(g_jmp, 1) != 0) return 0;
         uintptr_t jobCur = *(uintptr_t*)(g_base + RVA_JOBCUR_GLOBAL);
         if (jobCur) jobId = *(uint64_t*)(jobCur + JOB_OFF_JOBID);
         bodyObj = *(void**)((uint8_t*)msgObj + 32);
     }
-    if (!bodyObj) return;
+    if (!bodyObj) return 0;
 
     // game_id is field 1 (fixed64) of the body. Serialize + parse it.
     size_t blen = 0;
     const uint8_t* bbytes = g_serializeBody(bodyObj, &blen);
-    if (!bbytes || blen == 0) return;
+    if (!bbytes || blen == 0) return 0;
     auto fields = PB::Parse(bbytes, blen);
     auto* f1 = PB::FindField(fields, 1);
     uint32_t appId = f1 ? (uint32_t)(f1->varintVal & 0xFFFFFF) : 0;
-    if (appId == 0 || !CloudIntercept::IsNamespaceApp(appId)) return;
+    if (appId == 0 || !CloudIntercept::IsNamespaceApp(appId)) return 0;
+
+    // Block the 818 only when we can serve a reply; otherwise the jobid hangs and
+    // stalls Steam's shared stats worker for all apps.
+    PB::Writer reqBody;
+    reqBody.WriteFixed64(1, (uint64_t)appId);     // game_id
+    reqBody.WriteVarint(2, 0);                     // crc_stats = 0 (force full send)
+    reqBody.WriteVarint(3, (uint64_t)(int64_t)-1);// schema_local_version = -1
+    auto reqBytes = reqBody.Data();
+    auto built = StatsHandlers::HandleLegacyGetUserStats(reqBytes.data(), reqBytes.size(), 0);
+    if (!built.has_value() || built->empty()) {
+        LOG("[Stats] Observed legacy GetUserStats(818) app=%u jobid=%llu -> nothing to serve, "
+            "passing through to Valve (avoids hung job)", appId, (unsigned long long)jobId);
+        return 0;  // let Valve answer; its 819 also carries the schema
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
-        g_queue.push(Pending{jobId, appId, cmInterface});
+        g_queue.push(Pending{jobId, appId, cmInterface, std::move(*built)});
     }
-    LOG("[Stats] Observed legacy GetUserStats(818) app=%u jobid=%llu -> queued 819",
+    LOG("[Stats] Observed legacy GetUserStats(818) app=%u jobid=%llu -> queued 819 (blocking send)",
         appId, (unsigned long long)jobId);
+    return 1;  // block the send -- we are the sole server for this app
 }
 
 // Build the raw CM wire bytes for a 819 response: [EMsg|protoflag][hdrLen][header]
@@ -185,22 +206,12 @@ static std::vector<uint8_t> BuildWirePacket(uint64_t jobIdTarget,
 struct RawPkt { uint32_t pad0; const uint8_t* data; uint32_t size; uint32_t refcount; uint32_t copyBuf; uint32_t pad[3]; };
 
 static void RouteOne(const Pending& p) {
-    // Build the 819 body from our store via the shared legacy handler. We hand it
-    // a minimal request body (game_id + crc=0 to force a full send) so it resolves
-    // the app and emits schema + stats + achievement_blocks.
-    PB::Writer reqBody;
-    reqBody.WriteFixed64(1, (uint64_t)p.appId);  // game_id
-    reqBody.WriteVarint(2, 0);                    // crc_stats = 0 (force send)
-    reqBody.WriteVarint(3, (uint64_t)(int64_t)-1);// schema_local_version = -1
-    auto reqBytes = reqBody.Data();
-
-    auto built = StatsHandlers::HandleLegacyGetUserStats(reqBytes.data(), reqBytes.size(), 0);
-    if (!built.has_value() || built->empty()) {
-        LOG("[Stats] 819 for app=%u: store had nothing to serve", p.appId);
+    if (p.body.empty()) {
+        LOG("[Stats] 819 for app=%u: empty body (unexpected) -- skipped", p.appId);
         return;
     }
 
-    auto wire = BuildWirePacket(p.jobIdTarget, *built);
+    auto wire = BuildWirePacket(p.jobIdTarget, p.body);
 
     CallGuard guard;
     if (sigsetjmp(g_jmp, 1) != 0) {
@@ -219,7 +230,12 @@ static void RouteOne(const Pending& p) {
         return;
     }
 
-    uint32_t engine = *(uint32_t*)(g_base + RVA_ENGINE_GLOBAL);
+    void** engPtr = SteamKvInjector::GetEngineGlobalPtr();
+    if (!engPtr || !*engPtr) {
+        LOG("[Stats] 819 inject app=%u: engine global not resolved", p.appId);
+        return;
+    }
+    uint32_t engine = (uint32_t)(uintptr_t)*engPtr;
     int jobMgr = (int)(engine + ENGINE_OFF_JOBMGR);
     int connCtx = *(int*)((uint8_t*)p.cmInterface + CCM_OFF_CONNCTX);
 

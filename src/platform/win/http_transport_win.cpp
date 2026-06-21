@@ -31,6 +31,15 @@ public:
         return true;
     }
 
+    // Scale send/receive timeouts with body size so multi-MB PUTs survive a slow link
+    // without making small requests wait on the 10s session default.
+    static void TuneTimeoutsForBody(HINTERNET hReq, size_t bodyBytes) {
+        if (bodyBytes <= 256 * 1024) return; // small requests keep the fast default
+        int sendMs = 60000;    // allow a multi-MB body to finish uploading
+        int receiveMs = 30000; // allow Drive to commit and reply
+        WinHttpSetTimeouts(hReq, 5000, 5000, sendMs, receiveMs);
+    }
+
     void Shutdown() override {
         if (m_session) {
             WinHttpCloseHandle(m_session);
@@ -65,6 +74,7 @@ public:
                                       WINHTTP_ADDREQ_FLAG_ADD);
         }
 
+        TuneTimeoutsForBody(hReq, body.size());
         BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
             (DWORD)body.size(), 0);
@@ -131,6 +141,7 @@ public:
         }
 
         HttpResp resp;
+        TuneTimeoutsForBody(hReq, body.size());
         BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
             (DWORD)body.size(), 0);

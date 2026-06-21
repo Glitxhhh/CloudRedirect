@@ -454,6 +454,7 @@ struct FindSteamCtx {
     uintptr_t base = 0;
     uintptr_t textStart = 0;
     uintptr_t textEnd = 0;
+    uintptr_t moduleEnd = 0; // highest mapped VA across all PT_LOAD segments
 };
 
 static int FindSteamPhdrCb(struct dl_phdr_info* info, size_t, void* data) {
@@ -466,16 +467,17 @@ static int FindSteamPhdrCb(struct dl_phdr_info* info, size_t, void* data) {
     auto* ctx = static_cast<FindSteamCtx*>(data);
     ctx->base = info->dlpi_addr;
 
-    // Find the largest PF_X (executable) segment as the .text region.
+    // Largest PF_X segment is .text; track the highest mapped VA for bounds checks.
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         const auto& ph = info->dlpi_phdr[i];
-        if (ph.p_type == PT_LOAD && (ph.p_flags & PF_X)) {
-            uintptr_t segStart = info->dlpi_addr + ph.p_vaddr;
-            uintptr_t segEnd = segStart + ph.p_memsz;
-            if ((segEnd - segStart) > (ctx->textEnd - ctx->textStart)) {
-                ctx->textStart = segStart;
-                ctx->textEnd = segEnd;
-            }
+        if (ph.p_type != PT_LOAD) continue;
+        uintptr_t segStart = info->dlpi_addr + ph.p_vaddr;
+        uintptr_t segEnd = segStart + ph.p_memsz;
+        if (segEnd > ctx->moduleEnd) ctx->moduleEnd = segEnd;
+        if ((ph.p_flags & PF_X) &&
+            (segEnd - segStart) > (ctx->textEnd - ctx->textStart)) {
+            ctx->textStart = segStart;
+            ctx->textEnd = segEnd;
         }
     }
     return 1;
@@ -511,47 +513,51 @@ static uintptr_t DecodeRelCall(uintptr_t addr) {
     return addr + 5 + rel;
 }
 
+// Match "lea reg, [ebx + disp32]" (8D /r with mod=10, rm=011); returns dest reg.
+static bool IsLeaEbxDisp32(const uint8_t* p, uint8_t& outReg) {
+    if (p[0] != 0x8D || (p[1] & 0xC7) != 0x83) return false;
+    outReg = (p[1] >> 3) & 7;
+    return true;
+}
+
 // Search for "add reg, 0xB88" (81 C0-C7 88 0B 00 00) in a range, then
 // back-trace to find the GOT-relative lea that loads the global engine ptr.
 // Returns the absolute address of the global (the dereferenced GOT entry).
 static uintptr_t FindGlobalEnginePtr(uintptr_t textStart, uintptr_t textEnd,
-                                     uintptr_t soBase) {
+                                     uintptr_t soBase, uintptr_t soEnd) {
     // Pattern: 81 Cx 88 0B 00 00 where x is C0-C7 (add eax..edi, 0xB88)
     const uint8_t* mem = reinterpret_cast<const uint8_t*>(textStart);
     size_t len = textEnd - textStart;
 
-    for (size_t i = 0; i + 6 <= len; ++i) {
+    for (size_t i = 8; i + 6 <= len; ++i) {
         if (mem[i] != 0x81) continue;
         uint8_t modrm = mem[i + 1];
         if (modrm < 0xC0 || modrm > 0xC7) continue;
         if (mem[i + 2] != 0x88 || mem[i + 3] != 0x0B ||
             mem[i + 4] != 0x00 || mem[i + 5] != 0x00) continue;
 
-        // Found add reg, 0xB88. Back-trace: expect "mov reg, [eax]" (2 bytes)
-        // and before that "lea eax, [ebx + offset]" (6 bytes: 8D 83 xx xx xx xx).
+        // Found add reg, 0xB88. Back-trace: expect "mov reg, [reg2]" (2 bytes)
+        // and before that "lea reg2, [ebx + disp32]" (6 bytes: 8D /r xx xx xx xx).
         // The lea loads the address of the global from GOT-relative addressing.
         uintptr_t addAddr = textStart + i;
 
-        // Check the 2 bytes before: should be "mov reg, [eax]" (8B xx)
-        if (i < 2) continue;
+        // 2 bytes before: "mov reg, [reg2]" (8B /r, mod=00). Accept any base reg
+        // except esp(4)/ebp(5), whose modrm=00 encodings mean SIB/disp32 instead.
         if (mem[i - 2] != 0x8B) continue;
-        // The modrm byte for "mov reg, [eax]" is (reg<<3)|0x00 with mod=00,rm=000
         uint8_t movModrm = mem[i - 1];
-        if ((movModrm & 0xC7) != 0x00 && (movModrm & 0xC7) != 0x28) continue;
-        // Could be mov ebp,[eax] (8B 28) or mov eax,[eax] (8B 00) etc.
+        if ((movModrm >> 6) != 0) continue;          // require mod=00 ([reg])
+        uint8_t movBase = movModrm & 7;
+        if (movBase == 4 || movBase == 5) continue;
 
-        // Check 6 bytes before that: "lea eax, [ebx + disp32]" = 8D 83 xx xx xx xx
-        if (i < 8) continue;
-        if (mem[i - 8] != 0x8D || mem[i - 7] != 0x83) continue;
+        // 6 bytes before that: "lea reg2, [ebx + disp32]"; reg2 must feed the mov.
+        uint8_t leaReg = 0;
+        if (!IsLeaEbxDisp32(&mem[i - 8], leaReg)) continue;
+        if (leaReg != movBase) continue;
 
-        // Found lea eax, [ebx + disp32] -- ebx-relative global address.
-        // In 32-bit PIC, ebx = _GLOBAL_OFFSET_TABLE_ set by the function's thunk
-        // (call __x86.get_pc_thunk.bx; add ebx, imm32). The lea computes the
-        // absolute address of the engine-global variable (.bss), which is the
-        // `void**` we need. Decode it for real instead of using a hardcoded fallback
-        // RVA -- the fallback is build-specific and silently wrong on other builds.
+        // 32-bit PIC: ebx = _GLOBAL_OFFSET_TABLE_; the lea computes the .bss global's
+        // absolute address. Decode it (a hardcoded fallback RVA is build-specific).
         int32_t leaDisp;
-        memcpy(&leaDisp, &mem[i - 6], 4);            // disp32 of lea eax,[ebx+disp]
+        memcpy(&leaDisp, &mem[i - 6], 4);            // disp32 of lea reg2,[ebx+disp]
 
         LOG("[KvInjector] SigScan: found 'add reg, 0xB88' at 0x%lx (base+0x%lx), "
             "lea disp=0x%lx",
@@ -584,6 +590,14 @@ static uintptr_t FindGlobalEnginePtr(uintptr_t textStart, uintptr_t textEnd,
         }
 
         uintptr_t engineVar = gotBase + (uint32_t)leaDisp;
+        if (engineVar <= soBase || (soEnd != 0 && engineVar >= soEnd)) {
+            // Decoded address outside the module's mapped range -- a false match;
+            // keep scanning rather than dereferencing garbage.
+            LOG("[KvInjector] SigScan: engine-global 0x%lx out of module bounds "
+                "[0x%lx,0x%lx); skipping match",
+                (unsigned long)engineVar, (unsigned long)soBase, (unsigned long)soEnd);
+            continue;
+        }
         LOG("[KvInjector] SigScan: decoded engine-global var at 0x%lx (base+0x%lx)",
             (unsigned long)engineVar, (unsigned long)(engineVar - soBase));
         return engineVar;
@@ -733,7 +747,8 @@ bool Init() {
                 (unsigned long)kvSetI32, (unsigned long)(kvSetI32 - base));
         }
 
-        uintptr_t globalEng = FindGlobalEnginePtr(ctx.textStart, ctx.textEnd, base);
+        uintptr_t globalEng = FindGlobalEnginePtr(ctx.textStart, ctx.textEnd, base,
+                                                  ctx.moduleEnd);
         if (globalEng) {
             LOG("[KvInjector] SigScan: globalEnginePtr at 0x%lx (base+0x%lx)",
                 (unsigned long)globalEng, (unsigned long)(globalEng - base));
@@ -1066,5 +1081,13 @@ bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
 }
 
 #endif // _WIN32
+
+void** GetEngineGlobalPtr() {
+#ifdef _WIN32
+    return nullptr; // Windows uses a different resolution path
+#else
+    return g_r.globalEnginePtr;
+#endif
+}
 
 } // namespace SteamKvInjector

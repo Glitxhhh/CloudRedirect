@@ -30,7 +30,6 @@
                 <ComboBoxItem Content="{res:Loc CloudProvider_GoogleDrive}" Tag="gdrive" />
                 <ComboBoxItem Content="{res:Loc CloudProvider_OneDrive}" Tag="onedrive" />
                 <ComboBoxItem Content="{res:Loc CloudProvider_FolderMappedDrive}" Tag="folder" />
-                <ComboBoxItem Content="{res:Loc CloudProvider_LocalOnly}" Tag="local" />
             </ComboBox>
 
             <TextBlock x:Name="PathLabel"
@@ -39,14 +38,15 @@
                        Foreground="{DynamicResource TextFillColorPrimaryBrush}"
                        Margin="0,0,0,8" />
 
-            <Grid Margin="0,0,0,4">
+            <Grid Margin="0,0,0,24">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <ui:TextBox x:Name="TokenPathBox"
                             Grid.Column="0"
-                            PlaceholderText="{res:Loc CloudProvider_TokenPlaceholder}" />
+                            PlaceholderText="{res:Loc CloudProvider_TokenPlaceholder}"
+                            LostFocus="TokenPathBox_LostFocus" />
                 <ui:Button x:Name="BrowseButton"
                            Grid.Column="1"
                            Content="{res:Loc CloudProvider_Browse}"
@@ -59,7 +59,8 @@
                        FontSize="11"
                        Foreground="{DynamicResource TextFillColorTertiaryBrush}"
                        TextWrapping="Wrap"
-                       Margin="0,0,0,24" />
+                       Visibility="Collapsed"
+                       Margin="0,-16,0,24" />
 
             <TextBlock Text="{res:Loc CloudProvider_Authentication}"
                        FontWeight="SemiBold"
@@ -114,10 +115,67 @@
                 </ScrollViewer>
             </Border>
 
-            <ui:Button Content="{res:Loc CloudProvider_SaveConfiguration}"
-                       Appearance="Primary"
-                       Icon="{ui:SymbolIcon Save24}"
-                       Click="SaveConfig_Click" />
+            <StackPanel x:Name="UploadInFlightSection" Margin="0,0,0,24" Visibility="Collapsed">
+                <TextBlock Text="{res:Loc CloudProvider_UploadInFlight}"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                           Margin="0,0,0,8" />
+                <TextBlock Text="{res:Loc CloudProvider_UploadInFlightHint}"
+                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                           TextWrapping="Wrap"
+                           Margin="0,0,0,12" />
+
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <!-- Slider + its tick labels share column 0 so the labels
+                         track the slider width exactly. Ticks every 5 MB
+                         (24..64); 24/44/64 fall on ticks at 0% / 50% / 100%.
+                         Two equal label columns split at 50%; Safe
+                         left-anchored, Balanced straddles the centre,
+                         Aggressive right-anchored. -->
+                    <StackPanel Grid.Column="0">
+                        <Slider x:Name="UploadInFlightSlider"
+                                Minimum="24" Maximum="64"
+                                TickFrequency="5" IsSnapToTickEnabled="True"
+                                TickPlacement="BottomRight"
+                                ValueChanged="UploadInFlightSlider_Changed" />
+                        <Grid Margin="0,4,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="1*" />
+                                <ColumnDefinition Width="1*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       HorizontalAlignment="Left"
+                                       Text="{res:Loc CloudProvider_UploadInFlightConservative}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                            <TextBlock Grid.Column="0" Grid.ColumnSpan="2"
+                                       HorizontalAlignment="Center"
+                                       Text="{res:Loc CloudProvider_UploadInFlightBalanced}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                            <TextBlock Grid.Column="1"
+                                       HorizontalAlignment="Right"
+                                       Text="{res:Loc CloudProvider_UploadInFlightAggressive}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                        </Grid>
+                    </StackPanel>
+
+                    <TextBlock x:Name="UploadInFlightValue"
+                               Grid.Column="1"
+                               MinWidth="64"
+                               TextAlignment="Right"
+                               VerticalAlignment="Top"
+                               Margin="12,0,0,0"
+                               FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                </Grid>
+            </StackPanel>
         </StackPanel>
     </ScrollViewer>
 </Page>

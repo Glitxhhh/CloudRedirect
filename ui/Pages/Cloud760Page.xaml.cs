@@ -169,7 +169,6 @@ public partial class Cloud760Page : Page
             _cloud = null;
             QuotaText.Text = "";
             StatusText.Text = "Error: " + ex.Message;
-            await Dialog.ShowErrorAsync("Steam Cloud", ex.Message);
         }
         finally
         {
@@ -200,7 +199,6 @@ public partial class Cloud760Page : Page
         catch (Exception ex)
         {
             StatusText.Text = "Error: " + ex.Message;
-            await Dialog.ShowErrorAsync("Steam Cloud", ex.Message);
         }
         finally
         {
@@ -259,7 +257,6 @@ public partial class Cloud760Page : Page
         catch (Exception ex)
         {
             StatusText.Text = "Error: " + ex.Message;
-            await Dialog.ShowErrorAsync("Steam Cloud", ex.Message);
         }
         finally
         {

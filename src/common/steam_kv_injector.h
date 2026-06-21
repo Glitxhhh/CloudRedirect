@@ -36,4 +36,9 @@ struct SaveFileRule {
 // Inject savefiles rules into UFS KV. Won't clobber existing children.
 bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules);
 
+// Dynamically-resolved engine global pointer (Linux only). Returns the address
+// of the pointer variable (void**) so callers can dereference it at call time.
+// Null if Init hasn't resolved it yet.
+void** GetEngineGlobalPtr();
+
 } // namespace SteamKvInjector

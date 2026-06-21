@@ -15,6 +15,7 @@
 #include "cloud_storage.h"
 #include "coop_yield.h"
 #include "cloud_provider.h"
+#include "cloud_provider_base.h" // g_uploadInFlightCapBytes
 #include "pending_ops_journal.h"
 #include "json.h"
 #include "legacy_metadata_cleanup.h"
@@ -373,6 +374,22 @@ static void ScheduleStartupMetadataSync() {
     // Manifest system fetches CN/manifest on-demand per app; no bulk startup sync.
     if (!CloudStorage::IsCloudActive()) return;
     LOG("[StartupSync] Cloud active; metadata will be fetched on-demand per app");
+
+    // Wipe the per-account stats cache when a different accountId is captured so a
+    // second account can't inherit the previous one's stats. No-op if unchanged.
+    uint32_t accountId = GetAccountId();
+    bool switched = StatsStore::ResetForAccountSwitch(accountId);
+
+    // Re-run native imports now that login set the accountId (the boot sweep ran
+    // before it was known, leaving never-launched apps at stats=0 -> 0.0% rarity).
+    // Detached off the net thread; runs once per login and re-arms on a switch.
+    static std::atomic<bool> s_postLoginImportStarted{false};
+    if (switched) s_postLoginImportStarted.store(false);
+    if (!s_postLoginImportStarted.exchange(true)) {
+        std::thread([]() {
+            StatsStore::RetryNativeImportsAfterLogin();
+        }).detach();
+    }
 }
 
 #define g_syncLuas MetadataSync::syncLuas
@@ -507,7 +524,7 @@ static std::vector<uint32_t> GetNamespaceApps() {
 }
 
 uint32_t GetAccountId();  // defined later
-void RequestSchemaForApp(uint32_t appId);  // defined later (schema auto-fetch)
+void RequestSchemaForApp(uint32_t appId, bool forceRefresh = false);  // defined later
 
 // "Mark as private" support: Steam stores per-user private appIds as a JSON array
 // under PrivateApps_<accountId> in localconfig.vdf. We honor it so the friends
@@ -1708,12 +1725,10 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
         return result;
     }
 
-    // Native Player.GetUserStats#1 (per IDA, this lands on slot 4 / vtable+32).
-    // Bodies here are RAW protobuf objects (no CProtoBufMsg +48 wrapper).
-    // Gated by sync_achievements: when off, do not interfere -- pass straight
-    // through to Steam's real server.
+    // Native Player.GetUserStats#1 (slot 4 / vtable+32). RAW protobuf bodies (no +48
+    // wrapper). Serving our schema+stats makes Steam display the achievement page.
     if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0
-        && MetadataSync::AchievementsEnabled()) {
+        && MetadataSync::SchemaFetchEnabled()) {
         if (requestBody && responseBody && g_serializeToArray) {
             auto reqBytes = SerializeBodyToBytes(requestBody);
             auto reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
@@ -1910,12 +1925,10 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
     }
 
     // ---- Native stats / playtime service RPCs --------------------------------
-    // Player.GetUserStats#1 (per-app): for namespace apps, answer from our store.
-    // Player.ClientGetLastPlayedTimes#1 (account-wide): let the real server reply,
-    // then APPEND our namespace apps' playtime so Steam shows it. Real owned games
-    // keep their server playtime (the client merges per-appid). See IDA notes.
+    // Player.GetUserStats#1 (per-app, +48 wrapper): answer namespace apps from our
+    // store so Steam displays the achievement page. Gated by schema_fetch.
     if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0
-        && MetadataSync::AchievementsEnabled()) {
+        && MetadataSync::SchemaFetchEnabled()) {
         if (request && response) {
             void* reqBody = *(void**)((uintptr_t)request + 48);
             if (reqBody) {
@@ -2944,6 +2957,80 @@ static __int64 __fastcall BuildDepotDependencyHook(__int64* a1, unsigned int a2,
 
 static bool TryHandleSchemaResponse(const uint8_t* data, uint32_t size);  // fwd decl
 
+// Inject the on-disk schema into an incoming 819 that lacks one, so Steam registers
+// the achievement page for lua-unlocked games Valve won't serve stats for.
+static void TryInjectSchemaInto819(CNetPacket* pkt) {
+    if (!MetadataSync::SchemaFetchEnabled()) return;
+    PacketView p;
+    if (!ParsePacket(pkt->pubData, pkt->cubData, p)) return;
+
+    auto bodyFields = PB::Parse(p.bodyData, p.bodyLen);
+    const PB::Field* gameIdF = PB::FindField(bodyFields, 1);
+    if (!gameIdF) return;
+    uint32_t appId = (uint32_t)(gameIdF->varintVal & 0xFFFFFF);
+    if (appId == 0 || !IsNamespaceApp(appId)) return;
+
+    // Already has a schema -- nothing to do.
+    const PB::Field* schemaF = PB::FindField(bodyFields, 4);
+    if (schemaF && schemaF->wireType == PB::LengthDelimited && schemaF->dataLen > 0)
+        return;
+
+    // Load schema from disk.
+    std::string schemaPath = g_steamPath + "appcache\\stats\\UserGameStatsSchema_"
+        + std::to_string(appId) + ".bin";
+    HANDLE hFile = CreateFileA(schemaPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) { CloseHandle(hFile); return; }
+    std::vector<uint8_t> schema(fileSize);
+    DWORD bytesRead = 0;
+    if (!ReadFile(hFile, schema.data(), fileSize, &bytesRead, nullptr) || bytesRead != fileSize) {
+        CloseHandle(hFile);
+        return;
+    }
+    CloseHandle(hFile);
+
+    // Rebuild body with schema injected. Preserve all original fields except
+    // eresult (force to OK) and schema (replace from disk).
+    PB::Writer newBody;
+    for (auto& f : bodyFields) {
+        if (f.fieldNum == 2) continue; // eresult -- we force OK below
+        if (f.fieldNum == 4) continue; // schema -- replaced from disk
+        if (f.wireType == PB::Varint)
+            newBody.WriteVarint(f.fieldNum, f.varintVal);
+        else if (f.wireType == PB::Fixed64)
+            newBody.WriteFixed64(f.fieldNum, f.varintVal);
+        else if (f.wireType == PB::Fixed32)
+            newBody.WriteFixed32(f.fieldNum, (uint32_t)f.varintVal);
+        else if (f.wireType == PB::LengthDelimited)
+            newBody.WriteBytes(f.fieldNum, f.data, f.dataLen);
+    }
+    newBody.WriteVarint(2, 1); // eresult = OK
+    newBody.WriteBytes(4, schema.data(), schema.size());
+
+    // Rebuild entire packet: [emsg(4)][hdrLen(4)][header][body]
+    uint32_t emsgRaw = (EMSG_CLIENT_GET_USER_STATS_RESP | PROTO_FLAG);
+    uint32_t headerLen = p.headerLen;
+    size_t newPktSize = 8 + headerLen + newBody.Size();
+    uint8_t* newBuf = (uint8_t*)VirtualAlloc(nullptr, newPktSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!newBuf) return;
+    memcpy(newBuf, &emsgRaw, 4);
+    memcpy(newBuf + 4, &headerLen, 4);
+    memcpy(newBuf + 8, p.headerData, headerLen);
+    memcpy(newBuf + 8 + headerLen, newBody.Data().data(), newBody.Size());
+
+    // Swap the packet data. The old buffer is owned by Steam's allocator so we
+    // can't free it -- just replace the pointer. The new buffer leaks (one per
+    // 819 response for namespace apps, tiny -- ~40KB, once per app per session).
+    pkt->pubData = newBuf;
+    pkt->cubData = (uint32_t)newPktSize;
+
+    LOG("[Schema] Injected disk schema (%u bytes) into 819 for namespace app %u",
+        fileSize, appId);
+}
+
 // RecvPkt monitor hook (logging + Approach D injection drain)
 static int64_t __fastcall RecvPktMonitorHook(void* thisptr, CNetPacket* pkt) {
     HookGuard guard;
@@ -2964,6 +3051,10 @@ static int64_t __fastcall RecvPktMonitorHook(void* thisptr, CNetPacket* pkt) {
     // Capture our injected schema-fetch responses (legacy EMsg 819).
     if (emsg == EMSG_CLIENT_GET_USER_STATS_RESP) {
         TryHandleSchemaResponse(pkt->pubData, pkt->cubData);
+        // For namespace apps: if Valve's response has no schema, inject it from
+        // disk so Steam registers the achievement page. Without this, lua-unlocked
+        // games show no achievements because Valve doesn't recognize ownership.
+        TryInjectSchemaInto819(pkt);
         return g_originalRecvPkt(thisptr, pkt);   // let Steam process it too
     }
 
@@ -4126,8 +4217,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
                 g_manifestPinsEnabled = pinCfg["manifest_pinning"].boolean();
             if (pinCfg["auto_comment"].type == Json::Type::Bool)
                 g_autoComment = pinCfg["auto_comment"].boolean();
-            if (pinCfg["show_non_steam_game"].type == Json::Type::Bool)
-                g_showNonSteamGame = pinCfg["show_non_steam_game"].boolean();
+            // show_non_steam_game is per-user, so it lives in the AppData config (read below).
 
             size_t totalPins = 0;
 
@@ -4492,6 +4582,15 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             HttpServer::SetMaxUploadMB(mb);
         }
 
+        // Concurrency cap, not a speed knob (see g_uploadInFlightCapBytes). Clamp
+        // 24..64 MB; out-of-range/absent keeps the 24 MB default.
+        if (cfg["upload_inflight_mb"].type == Json::Type::Number) {
+            int mb = static_cast<int>(cfg["upload_inflight_mb"].integer());
+            if (mb >= 24 && mb <= 64)
+                g_uploadInFlightCapBytes.store((uint64_t)mb << 20,
+                    std::memory_order_relaxed);
+        }
+
         // Lua sync requires SteamTools.
         if (MetadataSync::steamToolsPresent.load(std::memory_order_relaxed)) {
             if (cfg["sync_luas"].type == Json::Type::Bool)
@@ -4503,9 +4602,9 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             MetadataSync::syncAchievements = cfg["sync_achievements"].boolean();
         if (cfg["sync_playtime"].type == Json::Type::Bool)
             MetadataSync::syncPlaytime = cfg["sync_playtime"].boolean();
-        // Experimental: proactive schema fetch (opt-in, default off).
-        if (cfg["experimental_schema_fetch"].type == Json::Type::Bool)
-            MetadataSync::schemaFetch = cfg["experimental_schema_fetch"].boolean();
+        // Schema fetch (default on).
+        if (cfg["schema_fetch"].type == Json::Type::Bool)
+            MetadataSync::schemaFetch = cfg["schema_fetch"].boolean();
         // UNSUPPORTED WIP OVERRIDE NON-ST CLIENT GATE (default off). Lets a non-ST
         // client run the metadata features that are otherwise hard-gated to ST.
         if (cfg["override_non_st_client_gate"].type == Json::Type::Bool)
@@ -4519,6 +4618,9 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             MetadataSync::overrideNonStGate.load() ? 1 : 0,
             MetadataSync::StGateOpen() ? 1 : 0);
         if (!cloudSaveOnly) {
+            // Per-user toggle: defaults to true (set at declaration) when absent.
+            if (cfg["show_non_steam_game"].type == Json::Type::Bool)
+                g_showNonSteamGame = cfg["show_non_steam_game"].boolean();
             if (cfg["parental_bypass_playtime"].type == Json::Type::Bool)
                 g_parentalBypassPlaytime = cfg["parental_bypass_playtime"].boolean();
             if (cfg["parental_ignore_playtime"].type == Json::Type::Bool)
@@ -4599,11 +4701,19 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             }
 
             // Overlay our app entries (already content-merged in the store).
+            // Fold each onto the live cloud entry (monotonic playtime, union
+            // achievements/stats) instead of replacing it, so a stale/lower copy
+            // can't clobber a higher value another device wrote after our startup
+            // pull -- the account-blob RMW mirror of the WriteAppStats guard.
             bool changed = false;
             for (const auto& [appId, json] : all) {
                 if (appId == 0) continue;
                 std::string key = std::to_string(appId);
-                Json::Value appVal = Json::Parse(json);
+                std::string baseEntry = root.has(key)
+                    ? Json::Stringify(root.objVal[key]) : std::string();
+                std::string mergedEntry =
+                    StatsStore::MergeAppStatsJson(baseEntry, json);
+                Json::Value appVal = Json::Parse(mergedEntry);
                 if (!root.has(key) || !Json::DeepEqual(root.objVal[key], appVal)) {
                     root.objVal[key] = std::move(appVal);
                     changed = true;
@@ -4645,19 +4755,30 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     // UserGameStats blobs (appcache\stats\UserGameStats_<accountId>_<appId>.bin).
     StatsStore::SetAccountIdProvider([]() -> uint32_t { return GetAccountId(); });
     StatsStore::SetNamespacePredicate([](uint32_t appId) { return IsNamespaceApp(appId); });
-    // When an import finds no achievement schema, fetch it from Steam's server.
+    // On import, refresh schema from Steam (forceRefresh detects new achievements;
+    // deduped per app per session by g_schemaFetchAttempted).
     StatsStore::SetSchemaMissingCallback([](uint32_t appId) {
-        // Run off-thread: this is called under the store mutex during import,
-        // and the fetch sends network messages + sleeps.
-        std::thread([appId] { RequestSchemaForApp(appId); }).detach();
+        std::thread([appId] { RequestSchemaForApp(appId, true); }).detach();
     });
     StatsStore::Init(cloudRoot, g_steamPath);
     StatsHandlers::Init();
     // Only seed when a stats feature is enabled: SeedApps also uploads imported
     // stats, so with both off it must stay inert (no cloud reads or writes).
+    // Run on a background thread: SeedApps does a cloud read per app, which on the
+    // init thread would block Steam's userdata load. g_mutex-serialized, so a launch
+    // racing the seed is safe. Tracked in g_bgThreads (joined at shutdown).
     if (MetadataSync::AchievementsEnabled() ||
-        MetadataSync::PlaytimeEnabled())
-        StatsStore::SeedApps(GetNamespaceApps());
+        MetadataSync::PlaytimeEnabled()) {
+        std::thread seed([] {
+            if (g_shuttingDown.load(std::memory_order_acquire)) return;
+            StatsStore::SeedApps(GetNamespaceApps());
+        });
+        std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
+        if (g_shuttingDown.load(std::memory_order_acquire))
+            seed.detach();
+        else
+            g_bgThreads.push_back(std::move(seed));
+    }
 
     // Background: poll the cloud for another device's playtime advances and push the
     // new totals into the running client's tracking map + library UI -- mirroring
@@ -4873,7 +4994,7 @@ static void MaybeScheduleSchemaSweep() {
     if (!MetadataSync::SchemaFetchEnabled()) return;
     if (g_schemaSweepScheduled.exchange(true)) return;   // once per session
     std::thread([] {
-        constexpr int kStartupSettleMs = 90000;          // wait for startup to finish
+        constexpr int kStartupSettleMs = 15000;          // wait for startup to settle
         for (int waited = 0; waited < kStartupSettleMs; waited += 500) {
             if (g_shuttingDown.load(std::memory_order_acquire)) return;
             Sleep(500);
@@ -4884,38 +5005,32 @@ static void MaybeScheduleSchemaSweep() {
 }
 
 static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
-    // Capture a live connection handle for our injected schema-fetch requests.
-    // Do NOT kick the schema sweep here: this fires during Steam's login/startup
-    // RPC burst, and injecting our requests then stalls the client (spinning-logo
-    // hang). The sweep is started on a delay timer (see SweepNamespaceSchemas /
-    // the deferred-start thread below) once startup has settled.
+    // Capture a live connection handle for injected schema-fetch requests. Don't kick
+    // the sweep here -- doing so during the startup RPC burst stalls the client.
     if (connHandle && pMsg) {
-        // Capture the connection handle, preferring the one Steam itself uses for
-        // GetUserStats (EMsg 818) -- that is the CM connection that receives 819
-        // replies. A handle grabbed from an unrelated send may be a different
-        // connection, so the server's reply would not route to where we listen.
+        // Prefer the conn Steam uses for GetUserStats (EMsg 818); that CM conn receives
+        // the 819 replies, so the server's reply routes back to where we listen.
         uint32_t hookEmsg = *(uint32_t*)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_EMSG) & EMSG_MASK;
         if (hookEmsg == EMSG_CLIENT_GET_USER_STATS) {
             if (g_statsConnHandle.exchange(connHandle, std::memory_order_relaxed) != connHandle)
                 LOG("[Schema] captured CM conn=%u from Steam's own GetUserStats", connHandle);
-            // Capture Steam's own header session fields (steamid, client_sessionid,
-            // realm) so we can stamp them onto our injected requests -- the CM
-            // server drops a GetUserStats whose header lacks these.
-            if (!g_hdrCaptured.load(std::memory_order_relaxed)) {
-                void* ownHdr = *(void**)((uintptr_t)pMsg + 0x28);
-                if (ownHdr) {
-                    uint8_t* hb = (uint8_t*)ownHdr;
-                    uint64_t sid = *(uint64_t*)(hb + 104);
-                    uint32_t ses = *(uint32_t*)(hb + 112);
-                    uint32_t rlm = *(uint32_t*)(hb + 156);
-                    if (sid != 0) {
-                        g_hdrSteamId.store(sid, std::memory_order_relaxed);
-                        g_hdrSessionId.store(ses, std::memory_order_relaxed);
-                        g_hdrRealm.store(rlm, std::memory_order_relaxed);
-                        g_hdrCaptured.store(true, std::memory_order_relaxed);
-                        LOG("[Schema] captured header session: steamid=0x%llX sessionid=%u realm=%u",
-                            (unsigned long long)sid, ses, rlm);
-                    }
+        }
+        // Capture session fields from any outgoing message so injected 818s carry valid
+        // context (if no game triggers a GetUserStats, the CM would drop our requests).
+        if (!g_hdrCaptured.load(std::memory_order_relaxed)) {
+            void* ownHdr = *(void**)((uintptr_t)pMsg + 0x28);
+            if (ownHdr) {
+                uint8_t* hb = (uint8_t*)ownHdr;
+                uint64_t sid = *(uint64_t*)(hb + 104);
+                uint32_t ses = *(uint32_t*)(hb + 112);
+                uint32_t rlm = *(uint32_t*)(hb + 156);
+                if (sid != 0) {
+                    g_hdrSteamId.store(sid, std::memory_order_relaxed);
+                    g_hdrSessionId.store(ses, std::memory_order_relaxed);
+                    g_hdrRealm.store(rlm, std::memory_order_relaxed);
+                    g_hdrCaptured.store(true, std::memory_order_relaxed);
+                    LOG("[Schema] captured header session: steamid=0x%llX sessionid=%u realm=%u (from emsg=%u)",
+                        (unsigned long long)sid, ses, rlm, hookEmsg);
                 }
             }
         }
@@ -4972,13 +5087,8 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
         }
         else if (emsg == EMSG_CLIENT_GET_USER_STATS &&
                  MetadataSync::AchievementsEnabled()) {
-            // Namespace apps fetch stats over the legacy 818 path (appid below the
-            // service-method threshold; see CAPIJobRequestUserStats_BYieldingRun),
-            // so serve a 819 from the store. The job MERGES our stats into its
-            // native blob loaded from disk (YieldingMergeStats -> "using SERVER
-            // stats data"); with no local UserGameStats_<acct>_<appid>.bin the load
-            // fails and it skips, so this surfaces another device's unlocks only
-            // when the game has been run here.
+            // We are the server for namespace apps: inject our 819 and suppress the 818
+            // so Valve's CM can't send a competing response that clobbers our stats.
             void* bodyObj = *(void**)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_BODY);
             if (bodyObj) {
                 auto reqBytes = SerializeBodyToBytes(bodyObj);
@@ -4991,11 +5101,13 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
                         auto built = StatsHandlers::HandleLegacyGetUserStats(
                             reqBytes.data(), reqBytes.size(), g_steamId.load());
                         if (built.has_value() && !built->empty()) {
-                            LOG("[Stats] GetUserStats(818) observed app=%u jobid=%llu -> serving 819",
+                            LOG("[Stats] GetUserStats(818) app=%u jobid=%llu -> serving 819 (blocking send)",
                                 appId, (unsigned long long)jobId);
                             InjectLegacyUserStatsResponse(jobId, appId, *built);
+                            // Don't forward to Valve -- we are the sole server.
+                            return 1;
                         } else {
-                            LOG("[Stats] GetUserStats(818) app=%u: store had nothing to serve", appId);
+                            LOG("[Stats] GetUserStats(818) app=%u: store had nothing to serve, passing through", appId);
                         }
                     }
                 }
@@ -5007,31 +5119,333 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
 }
 
 // ── Achievement-schema auto-fetch ──────────────────────────────────────
-//
-// When a namespace (lua) app has no UserGameStatsSchema_<appid>.bin, we ask
-// Steam's server for the schema by sending CMsgClientGetUserStats (EMsg 818)
-// with schema_local_version=-1 ("send latest") on behalf of a SteamID that
-// OWNS the game (steam_id_for_user). The server only returns the schema to an
-// owner, so we rotate through a list of public accounts that own huge
-// libraries until one succeeds. Steam's own 819 response handler writes the
-// schema .bin to disk -- we only trigger the request.
-// (Technique verified against steamclient64 + SLScheevo / GBE_Tools.)
+// Request a missing schema via CMsgClientGetUserStats (818, schema_local_version=-1)
+// on behalf of a SteamID that OWNS the game; the CM only returns schemas to owners.
+// Owner discovery: (1) appdetails confirms category 22; (2) probe recent reviewers
+// for public stats; (3) fall back to known large-library accounts.
 
-// Public SteamID64s with very large libraries (subset of SLScheevo's list).
-static const uint64_t kSchemaOwnerIds[] = {
-    76561197978902089ull, // Terrum (https://steamcommunity.com/id/Terrum/)
-    76561198028121353ull, 76561198017975643ull, 76561198001678750ull,
-    76561198355953202ull, 76561197993544755ull, 76561198121643357ull,
-    76561198001237877ull, 76561197979911851ull, 76561198217186687ull,
-    76561198152618007ull, 76561197973009892ull, 76561198237402290ull,
-    76561198213148949ull, 76561198108581917ull, 76561198037867621ull,
-    76561197965319961ull, 76561197976597747ull, 76561198019712127ull,
-    76561198094227663ull, 76561197969050296ull,
+// Fallback SteamID64s, used only if review-owner discovery yields no candidates.
+static const uint64_t kFallbackOwnerIds[] = {
+    76561197978902089ull, 76561198028121353ull, 76561198017975643ull,
+    76561198001678750ull, 76561198355953202ull, 76561197993544755ull,
 };
 
-// Apps we've already attempted a schema fetch for this session (avoid spamming).
+// Per-app schema fetch state. Tracks which owners we've tried and manages the
+// review-owner discovery + retry pipeline.
+struct SchemaFetchState {
+    std::vector<uint64_t> owners;       // owners queued to try (review + fallback)
+    size_t nextOwnerIdx = 0;            // next owner in `owners` to enqueue
+    uint32_t responsesReceived = 0;     // 819 responses received (with or without schema)
+    uint32_t requestsSent = 0;          // requests dispatched so far
+    bool reviewFetched = false;         // true once we've tried the review API
+    bool resolved = false;              // true once schema written to disk
+};
+
 static std::mutex g_schemaFetchMutex;
 static std::unordered_set<uint32_t> g_schemaFetchAttempted;
+static std::unordered_map<uint32_t, SchemaFetchState> g_schemaFetchStates;
+
+// Cache of apps checked for achievement support. true = supports, false = does not.
+static std::unordered_map<uint32_t, bool> g_achievementSupportCache;
+
+// Persistent skip-list of apps with no fetchable schema (cr_schema_skip.txt).
+// Prevents the proactive sweep from re-queuing ~120 schema-less apps every
+// session. Re-probed after kSchemaSkipRetrySecs.
+static std::mutex g_schemaSkipMutex;
+static std::unordered_map<uint32_t, uint64_t> g_schemaSkip;   // appId -> unix epoch when skip-listed
+static std::atomic<bool> g_schemaSkipLoaded{false};
+
+// Re-probe skip-listed apps after 14 days so games that add achievements later
+// are eventually picked up.
+static constexpr uint64_t kSchemaSkipRetrySecs = 14ull * 24 * 60 * 60;
+
+static uint64_t NowEpochSecs() {
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+}
+
+static std::string SchemaSkipPath() {
+    // Our private bookkeeping -- keep it in CloudRedirect's own dir, not buried
+    // in Steam's appcache\stats (which holds Steam's real schema/stats blobs).
+    return g_steamPath + "cloud_redirect\\cr_schema_skip.txt";
+}
+
+// Rewrite cr_schema_skip.txt from the in-memory map (one line per app, last
+// timestamp wins). Caller must hold g_schemaSkipMutex. Keeps the file bounded
+// since AddSchemaSkip only ever appends.
+static void RewriteSchemaSkipFileLocked() {
+    std::string out;
+    out.reserve(g_schemaSkip.size() * 20);
+    for (const auto& kv : g_schemaSkip)
+        out += std::to_string(kv.first) + "," + std::to_string(kv.second) + "\r\n";
+    HANDLE h = CreateFileA(SchemaSkipPath().c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, out.data(), (DWORD)out.size(), &w, nullptr);
+    CloseHandle(h);
+}
+
+static void LoadSchemaSkipList() {
+    if (g_schemaSkipLoaded.exchange(true)) return;
+    HANDLE h = CreateFileA(SchemaSkipPath().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    std::string buf;
+    char chunk[4096];
+    DWORD got = 0;
+    // Bound the read: a sane skip-list is a few KB. A pathologically large file
+    // (corruption) is truncated rather than ballooning RAM.
+    constexpr size_t kMaxSkipFileBytes = 4 * 1024 * 1024;
+    while (ReadFile(h, chunk, sizeof(chunk), &got, nullptr) && got > 0) {
+        buf.append(chunk, got);
+        if (buf.size() >= kMaxSkipFileBytes) break;
+    }
+    CloseHandle(h);
+    std::lock_guard<std::mutex> lock(g_schemaSkipMutex);
+    size_t pos = 0;
+    bool sawDuplicate = false;
+    while (pos < buf.size()) {
+        size_t nl = buf.find('\n', pos);
+        std::string line = buf.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        // Lines are "appId,epoch"; tolerate a bare "appId" (epoch=0 -> retry soon).
+        size_t comma = line.find(',');
+        try {
+            uint32_t id = (uint32_t)std::stoul(line.substr(0, comma));
+            uint64_t ts = (comma == std::string::npos) ? 0 : std::stoull(line.substr(comma + 1));
+            if (id) {
+                if (!g_schemaSkip.emplace(id, ts).second) { g_schemaSkip[id] = ts; sawDuplicate = true; }
+            }
+        } catch (...) {}
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    // Compact away accumulated append-duplicates so the file can't grow forever.
+    if (sawDuplicate) RewriteSchemaSkipFileLocked();
+}
+
+static bool IsSchemaSkipped(uint32_t appId) {
+    std::lock_guard<std::mutex> lock(g_schemaSkipMutex);
+    return g_schemaSkip.count(appId) != 0;
+}
+
+// True if a skip-listed app is due for a re-probe (skip-listed long enough ago).
+static bool SchemaSkipDueForRetry(uint32_t appId) {
+    std::lock_guard<std::mutex> lock(g_schemaSkipMutex);
+    auto it = g_schemaSkip.find(appId);
+    if (it == g_schemaSkip.end()) return true;
+    return NowEpochSecs() >= it->second + kSchemaSkipRetrySecs;
+}
+
+// Skip-list an app (idempotent per timestamp). Re-appends on retry so the
+// cooldown clock restarts; the file is compacted on next LoadSchemaSkipList
+// (last line for an id wins). Only the CM exhaustion path calls this.
+static void AddSchemaSkip(uint32_t appId) {
+    uint64_t now = NowEpochSecs();
+    {
+        std::lock_guard<std::mutex> lock(g_schemaSkipMutex);
+        g_schemaSkip[appId] = now;
+    }
+    HANDLE h = CreateFileA(SchemaSkipPath().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, nullptr, FILE_END);
+    std::string line = std::to_string(appId) + "," + std::to_string(now) + "\r\n";
+    DWORD w = 0;
+    WriteFile(h, line.data(), (DWORD)line.size(), &w, nullptr);
+    CloseHandle(h);
+}
+
+// True if the Store API confirms achievements (category 22). Fail-open: HTTP errors
+// return true so transient network issues don't silently skip the schema fetch.
+static bool AppSupportsAchievements(uint32_t appId) {
+    {
+        std::lock_guard<std::mutex> lock(g_schemaFetchMutex);
+        auto it = g_achievementSupportCache.find(appId);
+        if (it != g_achievementSupportCache.end()) return it->second;
+    }
+
+    wchar_t path[256];
+    swprintf_s(path, L"/api/appdetails?appids=%u&filters=categories", appId);
+
+    HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return true;  // fail-open
+    WinHttpSetTimeouts(hSession, 2000, 2000, 3000, 3000);
+
+    HINTERNET hConn = WinHttpConnect(hSession, L"store.steampowered.com",
+        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConn) { WinHttpCloseHandle(hSession); return true; }
+
+    HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", path,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return true; }
+
+    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0);
+    if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
+    if (!ok) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+        return true;  // fail-open
+    }
+
+    DWORD statusCode = 0, codeLen = sizeof(statusCode);
+    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &codeLen, WINHTTP_NO_HEADER_INDEX);
+    if (statusCode != 200) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+        return true;  // fail-open
+    }
+
+    std::string body;
+    DWORD avail, got;
+    while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
+        if (body.size() + avail > 64 * 1024) break;
+        size_t off = body.size();
+        body.resize(off + avail);
+        got = 0;
+        WinHttpReadData(hReq, &body[off], avail, &got);
+        body.resize(off + got);
+    }
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+
+    // Look for "success":false (unlisted/removed apps)
+    if (body.find("\"success\":false") != std::string::npos) {
+        // Can't determine -- fail-open (might be region-locked but still have achievements)
+        return true;
+    }
+
+    // Category 22 = "Steam Achievements". Search for "id":22 in the categories array.
+    bool supports = (body.find("\"id\":22") != std::string::npos);
+    {
+        std::lock_guard<std::mutex> lock(g_schemaFetchMutex);
+        g_achievementSupportCache[appId] = supports;
+    }
+    if (!supports) {
+        LOG("[Schema] app %u: no achievement support (category 22 absent), skipping", appId);
+    }
+    return supports;
+}
+
+// Fetch review-owner SteamIDs for an app from the Steam Store API. Returns the
+// IDs parsed from the appreviews JSON, or empty on failure. This is an HTTP call
+// so must NOT be called on the network thread.
+static std::vector<uint64_t> FetchReviewOwnerIds(uint32_t appId) {
+    std::vector<uint64_t> ids;
+    wchar_t path[256];
+    swprintf_s(path, L"/appreviews/%u?json=1&filter=recent&language=all"
+               L"&purchase_type=all&num_per_page=20", appId);
+
+    HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return ids;
+    WinHttpSetTimeouts(hSession, 3000, 3000, 5000, 5000);
+
+    HINTERNET hConn = WinHttpConnect(hSession, L"store.steampowered.com",
+        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConn) { WinHttpCloseHandle(hSession); return ids; }
+
+    HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", path,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return ids; }
+
+    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0);
+    if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
+    if (!ok) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+        return ids;
+    }
+
+    DWORD statusCode = 0, codeLen = sizeof(statusCode);
+    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &codeLen, WINHTTP_NO_HEADER_INDEX);
+    if (statusCode != 200) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+        return ids;
+    }
+
+    std::string body;
+    DWORD avail, got;
+    while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
+        if (body.size() + avail > 256 * 1024) break;
+        size_t off = body.size();
+        body.resize(off + avail);
+        got = 0;
+        WinHttpReadData(hReq, &body[off], avail, &got);
+        body.resize(off + got);
+    }
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+
+    // Parse "steamid":"<digits>" from the JSON response
+    constexpr uint64_t kSteamId64Base = 76561197960265728ull;
+    size_t pos = 0;
+    while ((pos = body.find("\"steamid\"", pos)) != std::string::npos) {
+        pos = body.find(':', pos);
+        if (pos == std::string::npos) break;
+        ++pos;
+        while (pos < body.size() && (body[pos] == ' ' || body[pos] == '"')) ++pos;
+        size_t start = pos;
+        while (pos < body.size() && body[pos] >= '0' && body[pos] <= '9') ++pos;
+        if (start == pos) continue;
+        uint64_t sid = strtoull(body.c_str() + start, nullptr, 10);
+        if (sid >= kSteamId64Base) {
+            bool dup = false;
+            for (uint64_t existing : ids) if (existing == sid) { dup = true; break; }
+            if (!dup) ids.push_back(sid);
+        }
+    }
+    return ids;
+}
+
+// Check if a SteamID has public stats for an app (via community XML endpoint).
+// Returns true if the profile's stats page is publicly accessible.
+static bool HasPublicStats(uint32_t appId, uint64_t steamId) {
+    wchar_t path[256];
+    swprintf_s(path, L"/profiles/%llu/stats/%u/?xml=1",
+               (unsigned long long)steamId, appId);
+
+    HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 2000, 2000, 3000, 3000);
+
+    HINTERNET hConn = WinHttpConnect(hSession, L"steamcommunity.com",
+        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConn) { WinHttpCloseHandle(hSession); return false; }
+
+    HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", path,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return false; }
+
+    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0);
+    if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
+    if (!ok) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    // Read just enough to check for public stats markers
+    std::string body;
+    DWORD avail, got;
+    while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
+        if (body.size() + avail > 32 * 1024) break;
+        size_t off = body.size();
+        body.resize(off + avail);
+        got = 0;
+        WinHttpReadData(hReq, &body[off], avail, &got);
+        body.resize(off + got);
+    }
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+
+    // Check for public stats indicators
+    return body.find("<playerstats>") != std::string::npos &&
+           body.find("<privacyState>public</privacyState>") != std::string::npos;
+}
 
 
 
@@ -5147,23 +5561,59 @@ static bool TryHandleSchemaResponse(const uint8_t* data, uint32_t size) {
                       schemaF->wireType == PB::LengthDelimited && schemaF->dataLen > 0);
     if (!hasSchema) {
         // This owner doesn't own the game (or sent no schema) -- another owner's
-        // reply may still land it.
+        // reply may still land it. Once every queued owner has replied with no
+        // schema, the app has none reachable: skip-list it so the next session's
+        // sweep doesn't re-flood the CM with the same dead fetches.
+        bool exhausted = false;
+        {
+            std::lock_guard<std::mutex> lock(g_schemaFetchMutex);
+            auto it = g_schemaFetchStates.find(appId);
+            if (it != g_schemaFetchStates.end() && !it->second.resolved) {
+                if (it->second.responsesReceived < it->second.requestsSent)
+                    it->second.responsesReceived++;
+                // All queued owners replied without a schema: exhausted. Mark
+                // resolved so a late duplicate 819 can't re-trigger skip-listing.
+                exhausted = it->second.requestsSent > 0 &&
+                            it->second.responsesReceived >= it->second.requestsSent;
+                if (exhausted) it->second.resolved = true;
+            }
+        }
+        if (exhausted) AddSchemaSkip(appId);
         return true;
     }
 
     std::string schemaPath = g_steamPath + "appcache\\stats\\UserGameStatsSchema_"
         + std::to_string(appId) + ".bin";
-    // Don't overwrite if a valid schema already arrived from a faster owner.
-    if (GetFileAttributesA(schemaPath.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    // Skip if a file already exists with the same size (no new achievements).
+    // If size differs, overwrite -- developer added/removed achievements.
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(schemaPath.c_str(), GetFileExInfoStandard, &fad)) {
+        if (fad.nFileSizeLow == schemaF->dataLen && fad.nFileSizeHigh == 0) return true;
+        LOG("[Schema] app %u: schema changed (%u -> %u bytes), updating",
+            appId, fad.nFileSizeLow, schemaF->dataLen);
+    }
 
     HANDLE h = CreateFileA(schemaPath.c_str(), GENERIC_WRITE, 0, nullptr,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
         WriteFile(h, schemaF->data, schemaF->dataLen, &written, nullptr);
         CloseHandle(h);
         LOG("[Schema] app %u: wrote schema (%u bytes) from server response",
             appId, schemaF->dataLen);
+        // Mark resolved so the exhaustion path can't skip-list this app.
+        {
+            std::lock_guard<std::mutex> lock(g_schemaFetchMutex);
+            auto it = g_schemaFetchStates.find(appId);
+            if (it != g_schemaFetchStates.end()) it->second.resolved = true;
+        }
+        // A schema landed: evict any stale skip entry (in memory and on disk) so
+        // a prior exhaustion record can't suppress future progress syncs.
+        {
+            std::lock_guard<std::mutex> lock(g_schemaSkipMutex);
+            if (g_schemaSkip.erase(appId)) RewriteSchemaSkipFileLocked();
+        }
+
 
         // Steam also needs a per-user stats file (UserGameStats_<accountid>_<appid>.bin)
         // to load this app's stats -- without it the schema loads but stats reading
@@ -5197,40 +5647,83 @@ static bool TryHandleSchemaResponse(const uint8_t* data, uint32_t size) {
     return true;
 }
 
-// Fetch the schema for one app by fanning requests across owner ids. Most owners
-// don't own the game (the server then replies minimally, often with no game_id),
-// so we DON'T block waiting per owner -- we fire all owners with gentle pacing and
-// let whichever owning account's 819 land the .bin (handled async in the recv
-// hook). The pacing (not blocking) is what keeps Steam's CM connection safe: 20
-// small messages spread over a few seconds instead of an instant burst.
-void RequestSchemaForApp(uint32_t appId) {
+// Fetch one app's schema. Must run on a background thread (does HTTP for owner
+// discovery); sends are queued for the net thread. forceRefresh re-fetches even if
+// the .bin exists, to detect newly-added achievements.
+void RequestSchemaForApp(uint32_t appId, bool forceRefresh) {
 #if !SCHEMA_FETCH_ENABLED
-    (void)appId; return;                              // kill-switch: see SCHEMA_FETCH_ENABLED
+    (void)appId; (void)forceRefresh; return;
 #endif
     if (!MetadataSync::SchemaFetchEnabled()) return;
     if (appId == 0) return;
-    if (g_liveConnHandle.load(std::memory_order_relaxed) == 0) return; // no conn yet
+    if (g_liveConnHandle.load(std::memory_order_relaxed) == 0) return;
 
     {
         std::lock_guard<std::mutex> lock(g_schemaFetchMutex);
-        if (!g_schemaFetchAttempted.insert(appId).second) return;  // already tried
+        if (!g_schemaFetchAttempted.insert(appId).second) return;  // once per session per app
     }
 
     std::string schemaPath = g_steamPath + "appcache\\stats\\UserGameStatsSchema_"
         + std::to_string(appId) + ".bin";
-    if (GetFileAttributesA(schemaPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    if (!forceRefresh) {
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        bool gotAttr = GetFileAttributesExA(schemaPath.c_str(), GetFileExInfoStandard, &fad);
+        uint64_t fsize = gotAttr ? ((uint64_t)fad.nFileSizeHigh << 32 | fad.nFileSizeLow) : 0;
+        if (gotAttr && fsize > 0) {
+            LOG("[Schema] RequestSchemaForApp %u: already on disk (%llu bytes), skipping",
+                appId, (unsigned long long)fsize);
+            return;
+        }
+        LOG("[Schema] RequestSchemaForApp %u: needs fetch (exists=%d size=%llu)",
+            appId, (int)gotAttr, (unsigned long long)fsize);
+    }
 
-    constexpr size_t kNumOwners = sizeof(kSchemaOwnerIds) / sizeof(kSchemaOwnerIds[0]);
-    // Enqueue one send per owner. The actual BAsyncSend happens on the network
-    // thread in DrainSchemaQueueOnNetThread (2 per tick), which both guarantees
-    // valid pipe/coroutine TLS and paces the traffic. Whichever owning account's
-    // 819 lands the .bin (handled async in the recv hook).
+    // NOTE: the Store API category-22 check was removed because newly released
+    // games can have achievements before Steam updates the store metadata.
+
+    // Phase 1: discover owners from recent reviews + verify public stats
+    std::vector<uint64_t> owners = FetchReviewOwnerIds(appId);
+    std::vector<uint64_t> verified;
+    for (uint64_t sid : owners) {
+        if (g_shuttingDown.load(std::memory_order_acquire)) return;
+        if (HasPublicStats(appId, sid)) {
+            verified.push_back(sid);
+            if (verified.size() >= 3) break;  // 3 verified owners is plenty
+        }
+    }
+
+    // Phase 2: if review discovery found nothing, append fallback owners
+    bool usingFallback = verified.empty();
+    if (usingFallback) {
+        for (uint64_t id : kFallbackOwnerIds)
+            verified.push_back(id);
+    }
+
+    if (verified.empty()) return;
+
+    // Store fetch state for response tracking
+    {
+        std::lock_guard<std::mutex> lock(g_schemaFetchMutex);
+        auto& state = g_schemaFetchStates[appId];
+        state.owners = verified;
+        state.nextOwnerIdx = 0;
+        state.requestsSent = (uint32_t)verified.size();
+        state.responsesReceived = 0;
+    }
+
+    // Enqueue sends for discovered owners. Cap the queue: a sweep that finds many
+    // schema-less apps must never build an unbounded 818 backlog that saturates
+    // the shared CM conn and starves Steam's own stats RPCs.
+    constexpr size_t kSchemaSendQueueMax = 256;
     {
         std::lock_guard<std::mutex> lock(g_schemaSendMutex);
-        for (uint64_t owner : kSchemaOwnerIds)
+        for (uint64_t owner : verified) {
+            if (g_schemaSendQueue.size() >= kSchemaSendQueueMax) break;
             g_schemaSendQueue.push({appId, owner});
+        }
     }
-    LOG("[Schema] app %u: queued %zu schema request(s)", appId, kNumOwners);
+    LOG("[Schema] app %u: queued %zu request(s) via %s",
+        appId, verified.size(), usingFallback ? "fallback" : "review-owner discovery");
 }
 
 // One-time-per-session proactive sweep: request schemas for ALL namespace apps
@@ -5257,28 +5750,55 @@ static void SweepNamespaceSchemas() {
 
     LOG("[Schema] Proactive sweep: checking %zu namespace app(s) for missing schemas", apps.size());
     std::thread([apps] {
-        // Hard cap on how many apps we enqueue schema requests for per session,
-        // bounding the send queue (cap * owners). Sends are paced by the net-thread
-        // drain (2/tick), so this just limits total queued work.
-        constexpr int kMaxAppsPerSweep = 48;
-        int requested = 0;
+        LoadSchemaSkipList();
+        // Filter to apps that actually need fetching (no .bin on disk, or zero-byte).
+        std::vector<uint32_t> needed;
         for (uint32_t appId : apps) {
-            if (g_shuttingDown.load(std::memory_order_acquire)) break;
-
-            // Skip apps already cached on disk without counting against the cap.
             std::string schemaPath = g_steamPath + "appcache\\stats\\UserGameStatsSchema_"
                 + std::to_string(appId) + ".bin";
-            if (GetFileAttributesA(schemaPath.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
-
-            if (requested >= kMaxAppsPerSweep) {
-                LOG("[Schema] Sweep cap reached (%d apps); remaining deferred to next session",
-                    kMaxAppsPerSweep);
-                break;
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            bool gotAttr = GetFileAttributesExA(schemaPath.c_str(), GetFileExInfoStandard, &fad);
+            uint64_t fsize = gotAttr ? ((uint64_t)fad.nFileSizeHigh << 32 | fad.nFileSizeLow) : 0;
+            if (gotAttr && fsize > 0) {
+                LOG("[Schema] Sweep: app %u schema present (%llu bytes), skipping",
+                    appId, (unsigned long long)fsize);
+                continue;
             }
-            RequestSchemaForApp(appId);   // enqueues only; net thread does the sends
-            ++requested;
+            // Skip apps already known to have no fetchable schema (CM ground
+            // truth), but re-probe occasionally for games that add achievements.
+            if (IsSchemaSkipped(appId) && !SchemaSkipDueForRetry(appId)) continue;
+            LOG("[Schema] Sweep: app %u schema missing/empty (exists=%d size=%llu)",
+                appId, (int)gotAttr, (unsigned long long)fsize);
+            needed.push_back(appId);
         }
-        LOG("[Schema] Proactive sweep complete: enqueued schemas for %d app(s)", requested);
+        if (needed.empty()) {
+            LOG("[Schema] Proactive sweep: all schemas present on disk");
+            return;
+        }
+        LOG("[Schema] Proactive sweep: %zu app(s) need schemas, fetching with %d workers",
+            needed.size(), 4);
+
+        // Fan out across worker threads. Each app's RequestSchemaForApp does
+        // HTTP (achievement check + review-owner + stats probe) so parallelism
+        // gives near-linear speedup on the I/O-bound work.
+        constexpr int kWorkers = 4;
+        std::atomic<size_t> idx{0};
+        std::atomic<int> totalRequested{0};
+        std::vector<std::thread> workers;
+        for (int w = 0; w < kWorkers; ++w) {
+            workers.emplace_back([&needed, &idx, &totalRequested] {
+                while (true) {
+                    if (g_shuttingDown.load(std::memory_order_acquire)) break;
+                    size_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= needed.size()) break;
+                    RequestSchemaForApp(needed[i]);
+                    totalRequested.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (auto& t : workers) t.join();
+        LOG("[Schema] Proactive sweep complete: enqueued schemas for %d app(s)",
+            totalRequested.load(std::memory_order_relaxed));
     }).detach();
 }
 

@@ -38,14 +38,21 @@ public static class SteamDetector
         {
             if (_cachedPath != null)
                 return _cachedPath;
+        }
 
-            // Try registry (most reliable on Windows)
-            _cachedPath = TryRegistry();
+        // Resolve outside the lock: registry/known-path lookups and the steam.exe
+        // walk-up touch the filesystem (incl. possibly-slow UNC paths) and must not
+        // stall other callers holding _cacheLock.
+        var resolved = NormalizeToSteamRoot(TryRegistry())
+                       ?? NormalizeToSteamRoot(TryKnownPaths());
+
+        lock (_cacheLock)
+        {
+            // Another thread may have resolved while we were outside the lock;
+            // prefer the already-cached value to keep a single stable result.
             if (_cachedPath != null)
                 return _cachedPath;
-
-            // Fallback: well-known paths
-            _cachedPath = TryKnownPaths();
+            _cachedPath = resolved;
             return _cachedPath;
         }
     }
@@ -58,7 +65,10 @@ public static class SteamDetector
     {
         if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
             return false;
-        lock (_cacheLock) { _cachedPath = path; }
+        var root = NormalizeToSteamRoot(path);
+        if (root == null)
+            return false;
+        lock (_cacheLock) { _cachedPath = root; }
         return true;
     }
 
@@ -102,6 +112,35 @@ public static class SteamDetector
         {
             // Version parse can fail if manifest is malformed — not critical
         }
+        return null;
+    }
+
+    /// <summary>
+    /// Given any path that may be a Steam root or a subfolder of one (e.g. a game's
+    /// install dir under steamapps\common), returns the Steam root identified by the
+    /// presence of steam.exe. Checks the path itself first, then walks up parents.
+    /// Returns null if no steam.exe is found anywhere up the chain.
+    /// </summary>
+    private static string? NormalizeToSteamRoot(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return null;
+
+        try
+        {
+            var dir = new DirectoryInfo(path);
+            while (dir != null)
+            {
+                if (File.Exists(Path.Combine(dir.FullName, "steam.exe")))
+                    return dir.FullName;
+                dir = dir.Parent;
+            }
+        }
+        catch
+        {
+            // Malformed path -- fall through to null
+        }
+
         return null;
     }
 

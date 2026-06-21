@@ -10,6 +10,7 @@
         <conv:UrlToImageSourceConverter x:Key="UrlToImageSource" />
     </Page.Resources>
 
+    <Grid>
     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="24">
         <StackPanel MaxWidth="800">
             <Grid Margin="0,0,0,4">
@@ -53,13 +54,6 @@
             <!-- No cloud configured -->
             <TextBlock x:Name="CloudUnavailableText"
                        Text="{res:Loc Stats_NoCloud}"
-                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                       TextWrapping="Wrap"
-                       Margin="0,0,0,8"
-                       Visibility="Collapsed" />
-
-            <!-- Transient status (loading / errors) -->
-            <TextBlock x:Name="StatusText"
                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                        TextWrapping="Wrap"
                        Margin="0,0,0,8"
@@ -243,4 +237,14 @@
             </ItemsControl>
         </StackPanel>
     </ScrollViewer>
+
+    <!-- Transient status (loading / errors), centered over the view -->
+    <TextBlock x:Name="StatusText"
+               HorizontalAlignment="Center"
+               VerticalAlignment="Center"
+               TextAlignment="Center"
+               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+               TextWrapping="Wrap"
+               Visibility="Collapsed" />
+    </Grid>
 </Page>

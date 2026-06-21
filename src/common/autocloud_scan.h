@@ -20,7 +20,6 @@ struct FileEntry {
     std::vector<uint8_t> sha;   // SHA1 hash (20 bytes)
     std::string rootToken;      // Cloud root token (e.g., "%WinAppDataLocal%")
     uint32_t rootId = 0;        // Steam ERemoteStorageFileRoot enum value
-    std::vector<uint8_t> content; // bytes read while hashing; empty if not retained
 };
 
 struct ScanResult {

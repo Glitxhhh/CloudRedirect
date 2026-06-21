@@ -473,19 +473,18 @@ std::string CmdListAllStats(const std::string& provider) {
         return JsonError("Search not supported for provider: " + provider);
     }
 
+    // Stats sync as one account-wide blob at <accountId>/0/stats.json; legacy
+    // installs keep per-app files. Expand the blob per app and de-dupe (account
+    // blob wins). Account scope lives under synthetic appId 0 (kAccountScopeAppId).
+    const std::string accountScope = "0";
+    std::unordered_set<std::string> seen;  // "<account>/<app>"
     std::ostringstream apps;
     apps << "[";
     bool first = true;
-    for (const auto& h : hits) {
-        // h.path is "<accountId>/<appId>/stats.json".
-        size_t s1 = h.path.find('/');
-        if (s1 == std::string::npos) continue;
-        size_t s2 = h.path.find('/', s1 + 1);
-        if (s2 == std::string::npos) continue;
-        std::string accountId = h.path.substr(0, s1);
-        std::string appId = h.path.substr(s1 + 1, s2 - s1 - 1);
-        std::string content(reinterpret_cast<const char*>(h.content.data()), h.content.size());
 
+    auto emit = [&](const std::string& accountId, const std::string& appId,
+                    const std::string& content) {
+        if (!seen.insert(accountId + "/" + appId).second) return;
         if (!first) apps << ",";
         apps << JsonObject({
             {"account_id", JsonString(accountId)},
@@ -493,6 +492,36 @@ std::string CmdListAllStats(const std::string& provider) {
             {"content", JsonString(content)}
         });
         first = false;
+    };
+
+    // Pass 1: account-scope blobs first so they win de-dup over legacy files.
+    // Pass 2: legacy per-app blobs for un-migrated apps.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (const auto& h : hits) {
+            // h.path is "<accountId>/<appId>/stats.json".
+            size_t s1 = h.path.find('/');
+            if (s1 == std::string::npos) continue;
+            size_t s2 = h.path.find('/', s1 + 1);
+            if (s2 == std::string::npos) continue;
+            std::string accountId = h.path.substr(0, s1);
+            std::string appId = h.path.substr(s1 + 1, s2 - s1 - 1);
+            bool isAccountBlob = (appId == accountScope);
+            if (isAccountBlob != (pass == 0)) continue;
+            std::string content(
+                reinterpret_cast<const char*>(h.content.data()), h.content.size());
+
+            if (isAccountBlob) {
+                // {"<appId>": {stats...}} -> one entry per app.
+                Json::Value root = Json::Parse(content);
+                if (root.type != Json::Type::Object) continue;
+                for (const auto& [appIdStr, appVal] : root.objVal) {
+                    if (appIdStr == accountScope) continue;
+                    emit(accountId, appIdStr, Json::Stringify(appVal));
+                }
+            } else {
+                emit(accountId, appId, content);
+            }
+        }
     }
     apps << "]";
     return std::string("{\"success\":true,\"apps\":") + apps.str() + "}";

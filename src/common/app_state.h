@@ -7,7 +7,6 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace CloudStorage {
@@ -104,11 +103,8 @@ void NoteOwnClientId(uint64_t clientId);
 // a stale RMW on providers with no conditional-write primitive.
 // lockOnly skips the blob verify/heal pass; use it only on the session-release
 // publish, where the manifest and CN were just committed by the upload batch.
-// `confirmedDurable` (optional) forwards to VerifyAndHealManifestForPublish: filenames
-// uploaded+provider-confirmed in this batch, so their durability needn't be re-listed.
 bool PublishCloudState(uint32_t accountId, uint32_t appId,
-                       const CloudAppState& state, bool lockOnly = false,
-                       const std::unordered_set<std::string>* confirmedDurable = nullptr);
+                       const CloudAppState& state, bool lockOnly = false);
 
 std::string SerializeState(const CloudAppState& state);
 bool DeserializeState(const std::string& json, CloudAppState& outState);

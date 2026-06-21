@@ -109,14 +109,14 @@
                                          TargetPageType="{x:Type pages:CleanupPage}" />
                 <ui:NavigationViewItem x:Name="NavCloud760"
                                          Icon="{ui:SymbolIcon CloudDismiss24}"
-                                         Content="760 Cleanup"
+                                         Content="760 Clean Up"
                                          TargetPageType="{x:Type pages:Cloud760Page}" />
-                <ui:NavigationViewItem Content="{res:Loc Nav_ManifestPinning}"
-                                         Icon="{ui:SymbolIcon Pin24}"
-                                         TargetPageType="{x:Type pages:ManifestPinningPage}" />
                 <ui:NavigationViewItem Content="{res:Loc Nav_Stats}"
                                          Icon="{ui:SymbolIcon Trophy24}"
                                          TargetPageType="{x:Type pages:StatsPage}" />
+                <ui:NavigationViewItem Content="{res:Loc Nav_ManifestPinning}"
+                                         Icon="{ui:SymbolIcon Pin24}"
+                                         TargetPageType="{x:Type pages:ManifestPinningPage}" />
             </ui:NavigationView.MenuItems>
 
             <ui:NavigationView.FooterMenuItems>

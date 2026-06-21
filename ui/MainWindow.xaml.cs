@@ -52,7 +52,8 @@ public partial class MainWindow : FluentWindow
         NavCleanup.Visibility = vis;
         NavCloud760.Visibility = vis;
 
-        // Hide the mode chooser once fully committed to cloud_redirect
+        // In cloud_redirect the mode chooser is hidden from the sidebar; the
+        // switch-back lives under Settings. In STFixer it stays visible.
         NavChoiceMode.Visibility = cloudOnly ? Visibility.Collapsed : Visibility.Visible;
 
         RootNavigation.UpdateLayout();
