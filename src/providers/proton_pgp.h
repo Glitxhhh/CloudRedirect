@@ -22,6 +22,15 @@ struct RsaKeyPair {
     std::vector<uint8_t> n, e, d, p, q, dp, dq, qi; // big-endian MPI bytes
 };
 
+// X25519 address key (Proton's "new" ECC key format). Only used for decrypting
+// the Drive share passphrase during GetRootFolderNode() -- all node keys in the
+// share's key chain remain RSA-2048 regardless of the address key's type.
+struct EccKeyPair {
+    std::vector<uint8_t> x25519Priv;  // 32 bytes, raw little-endian scalar
+    std::vector<uint8_t> x25519Pub;   // 32 bytes, raw little-endian point
+    std::vector<uint8_t> fingerprint; // 20 bytes, SHA-1 fingerprint of the subkey's public packet
+};
+
 // Generate a fresh RSA-2048 key pair. Returns false on failure.
 bool GenerateRsaKeyPair(RsaKeyPair& out);
 
@@ -74,6 +83,12 @@ bool EncryptMessage(const std::vector<uint8_t>& recipientN,
 bool DecryptMessage(const std::string& armored,
                     const RsaKeyPair& kp,
                     std::vector<uint8_t>& outPlaintext);
+
+// Decrypt an OpenPGP PKESK+SEIPD message using an X25519 ECDH address key
+// (RFC 6637 ECDH KDF + RFC 3394 AES key unwrap, matching Proton's GopenPGP).
+bool DecryptMessageEcc(const std::string& armored,
+                       const EccKeyPair& kp,
+                       std::vector<uint8_t>& outPlaintext);
 
 // ── Signature ────────────────────────────────────────────────────────────────
 

@@ -511,6 +511,124 @@ done:
     return ok;
 }
 
+// Constant 225-byte Curve25519 BCRYPT_ECCFULLKEY_BLOB header (curve domain
+// parameters); identical for every Curve25519 key since the curve itself never
+// changes -- only the trailing X (32 bytes) + Y (32 bytes, always zero for this
+// Montgomery curve) + d (32 bytes, private keys only) fields vary per key.
+// Captured from a real BCryptExportKey(BCRYPT_ECCFULLPRIVATE_BLOB) call; BCrypt's
+// "basic" (non-FULL) ECC blob format does not round-trip for generic curves.
+static const uint8_t kCurve25519FullBlobHeader[225] = {
+    0x45,0x43,0x4b,0x56,0x01,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x20,0x00,0x00,0x00,0x20,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x7f,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xed,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x07,0x6d,0x06,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x09,0x20,0xae,0x19,0xa1,0xb8,0xa0,0x86,0xb4,0xe0,0x1e,0xdd,0x2c,
+    0x77,0x48,0xd1,0x4c,0x92,0x3d,0x4d,0x7e,0x6d,0x7c,0x61,0xb2,0x29,0xe9,0xc5,0xa2,
+    0x7e,0xce,0xd3,0xd9,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x14,0xde,0xf9,0xde,0xa2,0xf7,0x9c,0xd6,0x58,0x12,0x63,0x1a,0x5c,
+    0xf5,0xd3,0xed,0x08,
+};
+
+// X25519 ECDH shared-secret derivation. CNG requires both X (public) and d
+// (private) for BCRYPT_ECCFULLPRIVATE_BLOB import and validates X == d*basepoint,
+// so privPub must be the real, matching public key (not a placeholder).
+static bool X25519Derive(const std::vector<uint8_t>& privScalar,
+                          const std::vector<uint8_t>& privPub,
+                          const std::vector<uint8_t>& peerPub,
+                          uint8_t outSecret[32]) {
+    if (privScalar.size() != 32 || privPub.size() != 32 || peerPub.size() != 32) return false;
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE privKey = nullptr, pubKey = nullptr;
+    BCRYPT_SECRET_HANDLE secret = nullptr;
+    bool ok = false;
+
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDH_ALGORITHM, nullptr, 0)) goto done;
+    {
+        std::vector<uint8_t> privBlob(kCurve25519FullBlobHeader, kCurve25519FullBlobHeader + 225);
+        privBlob.insert(privBlob.end(), privPub.begin(), privPub.end());
+        privBlob.insert(privBlob.end(), 32, 0); // Y, unused for this curve
+        privBlob.insert(privBlob.end(), privScalar.begin(), privScalar.end());
+        if (BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCFULLPRIVATE_BLOB, &privKey,
+                                 privBlob.data(), (ULONG)privBlob.size(), 0)) goto done;
+    }
+    {
+        std::vector<uint8_t> pubBlob(kCurve25519FullBlobHeader, kCurve25519FullBlobHeader + 225);
+        pubBlob.insert(pubBlob.end(), peerPub.begin(), peerPub.end());
+        pubBlob.insert(pubBlob.end(), 32, 0);
+        if (BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCFULLPUBLIC_BLOB, &pubKey,
+                                 pubBlob.data(), (ULONG)pubBlob.size(), 0)) goto done;
+    }
+    if (BCryptSecretAgreement(privKey, pubKey, &secret, 0)) goto done;
+    {
+        ULONG outLen = 0;
+        if (BCryptDeriveKey(secret, BCRYPT_KDF_RAW_SECRET, nullptr, nullptr, 0, &outLen, 0)) goto done;
+        std::vector<uint8_t> raw(outLen);
+        if (BCryptDeriveKey(secret, BCRYPT_KDF_RAW_SECRET, nullptr, raw.data(), outLen, &outLen, 0)) goto done;
+        if (raw.size() != 32) goto done;
+        // BCRYPT_KDF_RAW_SECRET returns the secret byte-reversed relative to the
+        // conventional X25519/RFC7748 order; reverse it back (verified empirically
+        // against this same key's own exported public key via ECDH(d, basepoint=9)).
+        for (int i = 0; i < 32; i++) outSecret[i] = raw[31 - i];
+        ok = true;
+    }
+done:
+    if (secret) BCryptDestroySecret(secret);
+    if (privKey) BCryptDestroyKey(privKey);
+    if (pubKey) BCryptDestroyKey(pubKey);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+// Single 16-byte AES-ECB block decrypt, used only by the RFC 3394 key-unwrap below.
+static bool AesEcbDecryptBlock(const uint8_t* key, int keyLen,
+                                const uint8_t* in16, uint8_t out16[16]) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    bool ok = false;
+
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0)) goto done;
+    if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
+            (PUCHAR)BCRYPT_CHAIN_MODE_ECB, sizeof(BCRYPT_CHAIN_MODE_ECB), 0)) goto done;
+    {
+        ULONG objLen = 0, dummy = 0;
+        if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &dummy, 0)) goto done;
+        std::vector<uint8_t> keyObj(objLen);
+        if (BCryptGenerateSymmetricKey(alg, &hKey, keyObj.data(), objLen,
+                                        (PUCHAR)key, (ULONG)keyLen, 0)) goto done;
+        ULONG outLen = 0;
+        if (BCryptDecrypt(hKey, (PUCHAR)in16, 16, nullptr, nullptr, 0, out16, 16, &outLen, 0)) goto done;
+        ok = (outLen == 16);
+    }
+done:
+    if (hKey) BCryptDestroyKey(hKey);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+static bool Sha256Hash(const uint8_t* data, size_t len, uint8_t out[32]) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    bool ok = false;
+    ULONG objLen = 0, dummy = 0;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) goto done;
+    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &dummy, 0)) goto done;
+    {
+        std::vector<uint8_t> obj(objLen);
+        if (BCryptCreateHash(alg, &hash, obj.data(), objLen, nullptr, 0, 0)) goto done;
+        if (BCryptHashData(hash, (PUCHAR)data, (ULONG)len, 0)) goto done;
+        if (BCryptFinishHash(hash, out, 32, 0)) goto done;
+        ok = true;
+    }
+done:
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
 // AES-256-CFB for SEIPD (OpenPGP MDC mode)
 static bool AesCfbEncrypt(const uint8_t* key, size_t keyLen,
                            const uint8_t* iv, size_t ivLen,
@@ -761,6 +879,54 @@ done:
     return ok;
 }
 
+// X25519 ECDH shared-secret derivation. OpenSSL's raw private-key API does not
+// require or validate a matching public key, unlike BCrypt's FULL-blob import.
+static bool X25519Derive(const std::vector<uint8_t>& privScalar,
+                          const std::vector<uint8_t>& /*privPub*/,
+                          const std::vector<uint8_t>& peerPub,
+                          uint8_t outSecret[32]) {
+    if (privScalar.size() != 32 || peerPub.size() != 32) return false;
+    bool ok = false;
+    EVP_PKEY* privEvp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, privScalar.data(), 32);
+    EVP_PKEY* pubEvp  = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, peerPub.data(), 32);
+    if (privEvp && pubEvp) {
+        EVP_PKEY_CTX* kctx = EVP_PKEY_CTX_new(privEvp, nullptr);
+        if (kctx) {
+            size_t ssLen = 32;
+            if (EVP_PKEY_derive_init(kctx) == 1 &&
+                EVP_PKEY_derive_set_peer(kctx, pubEvp) == 1 &&
+                EVP_PKEY_derive(kctx, outSecret, &ssLen) == 1 &&
+                ssLen == 32) {
+                ok = true;
+            }
+            EVP_PKEY_CTX_free(kctx);
+        }
+    }
+    EVP_PKEY_free(privEvp);
+    EVP_PKEY_free(pubEvp);
+    return ok;
+}
+
+// Single 16-byte AES-ECB block decrypt, used only by the RFC 3394 key-unwrap below.
+static bool AesEcbDecryptBlock(const uint8_t* key, int keyLen,
+                                const uint8_t* in16, uint8_t out16[16]) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+    bool ok = false;
+    const EVP_CIPHER* cipher = (keyLen == 32) ? EVP_aes_256_ecb() : EVP_aes_128_ecb();
+    int outLen = 0;
+    if (EVP_DecryptInit_ex(ctx, cipher, nullptr, key, nullptr) == 1) {
+        EVP_CIPHER_CTX_set_padding(ctx, 0);
+        if (EVP_DecryptUpdate(ctx, out16, &outLen, in16, 16) == 1 && outLen == 16) ok = true;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
+static bool Sha256Hash(const uint8_t* data, size_t len, uint8_t out[32]) {
+    return SHA256(data, len, out) != nullptr;
+}
+
 static bool AesCfbEncrypt(const uint8_t* key, size_t keyLen,
                            const uint8_t* iv, size_t ivLen,
                            const uint8_t* plaintext, size_t len,
@@ -801,6 +967,51 @@ done:
     return ok;
 }
 #endif // platform crypto
+
+// ── RFC 3394 AES key unwrap (used by OpenPGP ECDH PKESK) ─────────────────────
+// Platform-agnostic: built on the single-block AesEcbDecryptBlock primitive
+// defined per-platform above.
+
+static bool Rfc3394Unwrap(const uint8_t* kek, int kekLen,
+                          const uint8_t* wrapped, size_t wrappedLen,
+                          std::vector<uint8_t>& out) {
+    if (wrappedLen < 24 || wrappedLen % 8 != 0) return false;
+    int n = (int)(wrappedLen / 8) - 1;
+
+    uint8_t A[8];
+    memcpy(A, wrapped, 8);
+    std::vector<uint8_t> R(n * 8);
+    memcpy(R.data(), wrapped + 8, n * 8);
+
+    for (int j = 5; j >= 0; j--) {
+        for (int i = n; i >= 1; i--) {
+            uint64_t t = (uint64_t)n * j + i;
+            uint8_t Bin[16];
+            memcpy(Bin, A, 8);
+            for (int k = 7; k >= 0; k--) { Bin[k] ^= (uint8_t)(t & 0xFF); t >>= 8; }
+            memcpy(Bin + 8, R.data() + (i - 1) * 8, 8);
+            uint8_t Bout[16];
+            if (!AesEcbDecryptBlock(kek, kekLen, Bin, Bout)) return false;
+            memcpy(A, Bout, 8);
+            memcpy(R.data() + (i - 1) * 8, Bout + 8, 8);
+        }
+    }
+
+    static const uint8_t kIV[8] = {0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6};
+    if (memcmp(A, kIV, 8) != 0) return false;
+    out = R;
+    return true;
+}
+
+static bool Pkcs5Unpad(std::vector<uint8_t>& data) {
+    if (data.empty()) return false;
+    int pad = data.back();
+    if (pad < 1 || pad > 8 || (size_t)pad > data.size()) return false;
+    for (size_t i = data.size() - pad; i < data.size(); i++)
+        if (data[i] != (uint8_t)pad) return false;
+    data.resize(data.size() - pad);
+    return true;
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -1168,6 +1379,83 @@ bool EncryptMessage(const std::vector<uint8_t>& recipientN,
     return true;
 }
 
+// Parse the next OpenPGP packet header at pktData[pos]; on success, pos is left
+// at the body start, tag/bodyLen describe the packet, bodyEnd = body start + bodyLen.
+static bool ReadPacketHeader(const std::vector<uint8_t>& pktData, size_t& pos,
+                              uint8_t& tag, size_t& bodyEnd) {
+    if (pos >= pktData.size() || !(pktData[pos] & 0x80)) return false;
+    bool newFmt = (pktData[pos] & 0x40) != 0;
+    tag = newFmt ? (pktData[pos] & 0x3f) : ((pktData[pos] >> 2) & 0x0f);
+    pos++;
+    size_t bodyLen = 0;
+    if (newFmt) {
+        uint8_t fl = pktData[pos++];
+        if (fl < 192) bodyLen = fl;
+        else if (fl < 224) { bodyLen = ((fl - 192) << 8) + pktData[pos++] + 192; }
+        else if (fl == 255) { bodyLen = ((size_t)pktData[pos]<<24)|((size_t)pktData[pos+1]<<16)|((size_t)pktData[pos+2]<<8)|pktData[pos+3]; pos+=4; }
+    } else {
+        uint8_t lt = pktData[pos-1] & 0x03;
+        if (lt == 0) bodyLen = pktData[pos++];
+        else if (lt == 1) { bodyLen = ((size_t)pktData[pos]<<8)|pktData[pos+1]; pos+=2; }
+        else if (lt == 2) { bodyLen = ((size_t)pktData[pos]<<24)|((size_t)pktData[pos+1]<<16)|((size_t)pktData[pos+2]<<8)|pktData[pos+3]; pos+=4; }
+        else bodyLen = pktData.size() - pos;
+    }
+    bodyEnd = pos + bodyLen;
+    return bodyEnd <= pktData.size();
+}
+
+// Decrypt the SEIPD (tag 18) packet body at pktData[pos..bodyEnd) given an
+// already-recovered session key. Shared by the RSA and ECDH PKESK paths below.
+static bool DecryptSeipdWithSessionKey(const uint8_t* pktData, size_t pos, size_t bodyEnd,
+                                        const std::vector<uint8_t>& sessionKey,
+                                        std::vector<uint8_t>& outPlaintext) {
+    size_t bp = pos;
+    bp++; // version
+    uint8_t iv[16] = {};
+    std::vector<uint8_t> decrypted;
+    if (!AesCfbDecrypt(sessionKey.data(), sessionKey.size(), iv, 16,
+                        pktData + bp, bodyEnd - bp, decrypted))
+        return false;
+
+    // Skip prefix (keysize + 2) + find literal data packet
+    size_t prefixLen = sessionKey.size() + 2;
+    if (decrypted.size() < prefixLen) return false;
+    size_t dp = prefixLen;
+
+    while (dp < decrypted.size()) {
+        if (!(decrypted[dp] & 0x80)) break;
+        bool nf2 = (decrypted[dp] & 0x40) != 0;
+        uint8_t tag2 = nf2 ? (decrypted[dp] & 0x3f) : ((decrypted[dp] >> 2) & 0x0f);
+        dp++;
+        size_t bl2 = 0;
+        if (nf2) {
+            uint8_t fl2 = decrypted[dp++];
+            if (fl2 < 192) bl2 = fl2;
+            else if (fl2 < 224) { bl2 = ((fl2-192)<<8)+decrypted[dp++]+192; }
+            else if (fl2 == 255) { bl2=((size_t)decrypted[dp]<<24)|((size_t)decrypted[dp+1]<<16)|((size_t)decrypted[dp+2]<<8)|decrypted[dp+3]; dp+=4; }
+        } else {
+            uint8_t lt2 = (decrypted[dp-1]) & 0x03;
+            if (lt2==0) bl2=decrypted[dp++];
+            else if (lt2==1){bl2=((size_t)decrypted[dp]<<8)|decrypted[dp+1];dp+=2;}
+            else if (lt2==2){bl2=((size_t)decrypted[dp]<<24)|((size_t)decrypted[dp+1]<<16)|((size_t)decrypted[dp+2]<<8)|decrypted[dp+3];dp+=4;}
+            else bl2=decrypted.size()-dp;
+        }
+        size_t be2 = dp + bl2;
+        if (tag2 == 11 && be2 <= decrypted.size()) {
+            // Literal data: format(1) + filename_len(1) + filename + time(4) + data
+            size_t lp = dp;
+            lp++; // format
+            uint8_t fnLen = decrypted[lp++];
+            lp += fnLen; // filename
+            lp += 4; // timestamp
+            outPlaintext.assign(decrypted.begin() + lp, decrypted.begin() + be2);
+            return true;
+        }
+        dp = be2;
+    }
+    return false;
+}
+
 bool DecryptMessage(const std::string& armored,
                     const RsaKeyPair& kp,
                     std::vector<uint8_t>& outPlaintext) {
@@ -1176,33 +1464,16 @@ bool DecryptMessage(const std::string& armored,
 
     size_t pos = 0;
     std::vector<uint8_t> sessionKey;
-    uint8_t sessionCipher = 0;
 
-    // Parse PKESK packet
     while (pos < pktData.size()) {
-        if (!(pktData[pos] & 0x80)) return false;
-        bool newFmt = (pktData[pos] & 0x40) != 0;
-        uint8_t tag = newFmt ? (pktData[pos] & 0x3f) : ((pktData[pos] >> 2) & 0x0f);
-        pos++;
-        size_t bodyLen = 0;
-        if (newFmt) {
-            uint8_t fl = pktData[pos++];
-            if (fl < 192) bodyLen = fl;
-            else if (fl < 224) { bodyLen = ((fl - 192) << 8) + pktData[pos++] + 192; }
-            else if (fl == 255) { bodyLen = ((size_t)pktData[pos]<<24)|((size_t)pktData[pos+1]<<16)|((size_t)pktData[pos+2]<<8)|pktData[pos+3]; pos+=4; }
-        } else {
-            uint8_t lt = pktData[pos-1] & 0x03;
-            if (lt == 0) bodyLen = pktData[pos++];
-            else if (lt == 1) { bodyLen = ((size_t)pktData[pos]<<8)|pktData[pos+1]; pos+=2; }
-            else if (lt == 2) { bodyLen = ((size_t)pktData[pos]<<24)|((size_t)pktData[pos+1]<<16)|((size_t)pktData[pos+2]<<8)|pktData[pos+3]; pos+=4; }
-            else bodyLen = pktData.size() - pos;
-        }
-        size_t bodyEnd = pos + bodyLen;
-        if (bodyEnd > pktData.size()) return false;
+        uint8_t tag; size_t bodyEnd;
+        size_t bodyStart = pos;
+        if (!ReadPacketHeader(pktData, pos, tag, bodyEnd)) return false;
+        bodyStart = pos;
 
         if (tag == 1 && sessionKey.empty()) {
-            // PKESK
-            size_t bp = pos;
+            // PKESK: version(1) + keyId(8) + algo(1) + algo-specific data
+            size_t bp = bodyStart;
             bp++; // version
             bp += 8; // key ID
             bp++; // algo
@@ -1211,55 +1482,91 @@ bool DecryptMessage(const std::string& armored,
             std::vector<uint8_t> skWithAlgo;
             if (!RsaOaepDecrypt(kp, encSK.data(), encSK.size(), skWithAlgo)) return false;
             if (skWithAlgo.empty()) return false;
-            sessionCipher = skWithAlgo[0];
             sessionKey.assign(skWithAlgo.begin() + 1, skWithAlgo.end());
         } else if (tag == 18 && !sessionKey.empty()) {
-            // SEIPD
-            size_t bp = pos;
+            return DecryptSeipdWithSessionKey(pktData.data(), bodyStart, bodyEnd, sessionKey, outPlaintext);
+        }
+        pos = bodyEnd;
+    }
+    return false;
+}
+
+bool DecryptMessageEcc(const std::string& armored,
+                       const EccKeyPair& kp,
+                       std::vector<uint8_t>& outPlaintext) {
+    if (kp.x25519Priv.size() != 32 || kp.x25519Pub.size() != 32 || kp.fingerprint.size() != 20)
+        return false;
+
+    std::vector<uint8_t> pktData;
+    if (!Dearmor(armored, pktData)) return false;
+
+    // Curve25519's registered OpenPGP ECDH OID and Proton's fixed KDF params --
+    // these never vary per-key, only the fingerprint (below) is key-specific.
+    static const uint8_t kCurve25519Oid[] = {0x2B,0x06,0x01,0x04,0x01,0x97,0x55,0x01,0x05,0x01};
+    const uint8_t kKdfHashAlgo = 8;   // SHA-256
+    const uint8_t kKdfCipherAlgo = 9; // AES-256
+
+    size_t pos = 0;
+    std::vector<uint8_t> sessionKey;
+
+    while (pos < pktData.size()) {
+        uint8_t tag; size_t bodyEnd;
+        size_t bodyStart = pos;
+        if (!ReadPacketHeader(pktData, pos, tag, bodyEnd)) return false;
+        bodyStart = pos;
+
+        if (tag == 1 && sessionKey.empty()) {
+            const uint8_t* b = pktData.data();
+            size_t bp = bodyStart;
             bp++; // version
-            uint8_t iv[16] = {};
-            std::vector<uint8_t> decrypted;
-            if (!AesCfbDecrypt(sessionKey.data(), sessionKey.size(), iv, 16,
-                                pktData.data() + bp, bodyEnd - bp, decrypted))
-                return false;
+            bp += 8; // key ID
+            if (bp >= bodyEnd) { pos = bodyEnd; continue; }
+            uint8_t pkedAlgo = b[bp++];
+            if (pkedAlgo != 18) { pos = bodyEnd; continue; } // not ECDH
 
-            // Skip prefix (keysize + 2) + find literal data packet
-            size_t prefixLen = sessionKey.size() + 2;
-            if (decrypted.size() < prefixLen) return false;
-            size_t dp = prefixLen;
+            std::vector<uint8_t> ephMpi;
+            if (!ReadMPI(b, bodyEnd, bp, ephMpi)) return false;
+            // X25519 point is stored as 0x40 || 32-byte raw key
+            if (ephMpi.size() != 33 || ephMpi[0] != 0x40) return false;
+            std::vector<uint8_t> ephPub(ephMpi.begin() + 1, ephMpi.end());
 
-            while (dp < decrypted.size()) {
-                if (!(decrypted[dp] & 0x80)) break;
-                bool nf2 = (decrypted[dp] & 0x40) != 0;
-                uint8_t tag2 = nf2 ? (decrypted[dp] & 0x3f) : ((decrypted[dp] >> 2) & 0x0f);
-                dp++;
-                size_t bl2 = 0;
-                if (nf2) {
-                    uint8_t fl2 = decrypted[dp++];
-                    if (fl2 < 192) bl2 = fl2;
-                    else if (fl2 < 224) { bl2 = ((fl2-192)<<8)+decrypted[dp++]+192; }
-                    else if (fl2 == 255) { bl2=((size_t)decrypted[dp]<<24)|((size_t)decrypted[dp+1]<<16)|((size_t)decrypted[dp+2]<<8)|decrypted[dp+3]; dp+=4; }
-                } else {
-                    uint8_t lt2 = (decrypted[dp-1]) & 0x03;
-                    if (lt2==0) bl2=decrypted[dp++];
-                    else if (lt2==1){bl2=((size_t)decrypted[dp]<<8)|decrypted[dp+1];dp+=2;}
-                    else if (lt2==2){bl2=((size_t)decrypted[dp]<<24)|((size_t)decrypted[dp+1]<<16)|((size_t)decrypted[dp+2]<<8)|decrypted[dp+3];dp+=4;}
-                    else bl2=decrypted.size()-dp;
-                }
-                size_t be2 = dp + bl2;
-                if (tag2 == 11 && be2 <= decrypted.size()) {
-                    // Literal data: format(1) + filename_len(1) + filename + time(4) + data
-                    size_t lp = dp;
-                    lp++; // format
-                    uint8_t fnLen = decrypted[lp++];
-                    lp += fnLen; // filename
-                    lp += 4; // timestamp
-                    outPlaintext.assign(decrypted.begin() + lp, decrypted.begin() + be2);
-                    return true;
-                }
-                dp = be2;
-            }
-            return false;
+            if (bp >= bodyEnd) return false;
+            uint8_t wrapLen = b[bp++];
+            if (bp + wrapLen > bodyEnd) return false;
+            const uint8_t* wrapped = b + bp;
+
+            uint8_t sharedSecret[32];
+            if (!X25519Derive(kp.x25519Priv, kp.x25519Pub, ephPub, sharedSecret)) return false;
+
+            // RFC 6637 other_info = len(oid)||oid||algo(18)||0x03||0x01||kdfHash||kdfCipher
+            //                       || "Anonymous Sender    " (20 bytes) || recipient fingerprint
+            std::vector<uint8_t> otherInfo;
+            otherInfo.push_back((uint8_t)sizeof(kCurve25519Oid));
+            otherInfo.insert(otherInfo.end(), kCurve25519Oid, kCurve25519Oid + sizeof(kCurve25519Oid));
+            otherInfo.push_back(18);
+            otherInfo.push_back(3);
+            otherInfo.push_back(1);
+            otherInfo.push_back(kKdfHashAlgo);
+            otherInfo.push_back(kKdfCipherAlgo);
+            static const char kAnonSender[] = "Anonymous Sender    ";
+            otherInfo.insert(otherInfo.end(), kAnonSender, kAnonSender + 20);
+            otherInfo.insert(otherInfo.end(), kp.fingerprint.begin(), kp.fingerprint.end());
+
+            std::vector<uint8_t> kdfInput = {0, 0, 0, 1};
+            kdfInput.insert(kdfInput.end(), sharedSecret, sharedSecret + 32);
+            kdfInput.insert(kdfInput.end(), otherInfo.begin(), otherInfo.end());
+
+            uint8_t kek[32];
+            if (!Sha256Hash(kdfInput.data(), kdfInput.size(), kek)) return false;
+            int kekLen = (kKdfCipherAlgo == 9) ? 32 : 16;
+
+            std::vector<uint8_t> unwrapped;
+            if (!Rfc3394Unwrap(kek, kekLen, wrapped, wrapLen, unwrapped)) return false;
+            if (!Pkcs5Unpad(unwrapped) || unwrapped.empty()) return false;
+
+            sessionKey.assign(unwrapped.begin() + 1, unwrapped.end());
+        } else if (tag == 18 && !sessionKey.empty()) {
+            return DecryptSeipdWithSessionKey(pktData.data(), bodyStart, bodyEnd, sessionKey, outPlaintext);
         }
         pos = bodyEnd;
     }

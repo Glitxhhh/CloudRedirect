@@ -3,8 +3,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
         Title="Two-Factor Authentication"
-        Height="220" Width="380"
-        MinHeight="220" MinWidth="340"
+        Width="460" MinWidth="420"
+        SizeToContent="Height"
         ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner"
         ExtendsContentIntoTitleBar="True">

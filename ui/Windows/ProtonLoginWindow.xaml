@@ -4,8 +4,8 @@
         xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
         xmlns:res="clr-namespace:CloudRedirect.Resources"
         Title="{res:Loc ProtonLogin_WindowTitle}"
-        Height="320" Width="420"
-        MinHeight="320" MinWidth="380"
+        Width="500" MinWidth="460"
+        SizeToContent="Height"
         ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner"
         ExtendsContentIntoTitleBar="True">

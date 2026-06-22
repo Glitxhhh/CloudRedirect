@@ -134,20 +134,28 @@ bool ProtonDriveProvider::LoadProtonFields() {
     m_rootLinkId = j["root_link_id"].str();
     m_addressEmail = j["address_email"].str();
 
-    // Decode raw RSA MPI components directly into m_addressKey.
     auto decodeComp = [&](const char* field, std::vector<uint8_t>& out) {
         std::string b64 = j[field].str();
         if (b64.empty()) return;
         B64Dec(b64, out);
     };
-    decodeComp("address_key_n",  m_addressKey.n);
-    decodeComp("address_key_e",  m_addressKey.e);
-    decodeComp("address_key_d",  m_addressKey.d);
-    decodeComp("address_key_p",  m_addressKey.p);
-    decodeComp("address_key_q",  m_addressKey.q);
-    decodeComp("address_key_dp", m_addressKey.dp);
-    decodeComp("address_key_dq", m_addressKey.dq);
-    decodeComp("address_key_qi", m_addressKey.qi);
+
+    m_addressKeyIsEcc = (j["address_key_type"].str() == "ecc");
+    if (m_addressKeyIsEcc) {
+        decodeComp("address_x25519_priv", m_addressKeyEcc.x25519Priv);
+        decodeComp("address_x25519_pub",  m_addressKeyEcc.x25519Pub);
+        decodeComp("address_key_fp",      m_addressKeyEcc.fingerprint);
+    } else {
+        // Decode raw RSA MPI components directly into m_addressKey.
+        decodeComp("address_key_n",  m_addressKey.n);
+        decodeComp("address_key_e",  m_addressKey.e);
+        decodeComp("address_key_d",  m_addressKey.d);
+        decodeComp("address_key_p",  m_addressKey.p);
+        decodeComp("address_key_q",  m_addressKey.q);
+        decodeComp("address_key_dp", m_addressKey.dp);
+        decodeComp("address_key_dq", m_addressKey.dq);
+        decodeComp("address_key_qi", m_addressKey.qi);
+    }
 
     if (m_uid.empty() || m_shareId.empty() || m_rootLinkId.empty()) {
         LOG("%s LoadProtonFields: missing required fields (uid/share_id/root_link_id)", LogTag());
@@ -158,7 +166,13 @@ bool ProtonDriveProvider::LoadProtonFields() {
 
 bool ProtonDriveProvider::EnsureKeysLoaded() {
     if (m_keysLoaded) return true;
-    if (m_addressKey.n.empty() || m_addressKey.d.empty()) {
+    if (m_addressKeyIsEcc) {
+        if (m_addressKeyEcc.x25519Priv.size() != 32 || m_addressKeyEcc.x25519Pub.size() != 32 ||
+            m_addressKeyEcc.fingerprint.size() != 20) {
+            LOG("%s EnsureKeysLoaded: ECC address key incomplete -- re-authenticate to refresh the token", LogTag());
+            return false;
+        }
+    } else if (m_addressKey.n.empty() || m_addressKey.d.empty()) {
         LOG("%s EnsureKeysLoaded: address key components not loaded", LogTag());
         return false;
     }
@@ -234,8 +248,11 @@ bool ProtonDriveProvider::GenerateNodeKey(const FolderNode& parent, NewNodeKey& 
         return false;
     out.nodeHashKeyMsg = hashKeyPgp;
 
-    // Sign nodeKeyArmored with address key.
-    if (!m_keysLoaded) {
+    // Sign nodeKeyArmored with address key. RSA-only -- Ed25519 signing for ECC
+    // address keys isn't implemented, so ECC accounts skip signatures, the same
+    // graceful fallback used when the address key isn't loaded at all. Proton's
+    // API does not reject folder/file creation for missing signatures.
+    if (!m_keysLoaded || m_addressKeyIsEcc) {
         out.nodeKeySignature.clear();
         out.nodePassphraseSignature.clear();
     } else {
@@ -276,13 +293,18 @@ ProtonDriveProvider::LookupStatus ProtonDriveProvider::GetRootFolderNode(FolderN
 
         // Share.Passphrase is an armored PGP message encrypted with the address key.
         // Some older API revisions base64-encode it again — try the direct form first.
+        auto decryptWithAddressKey = [&](const std::string& msg, std::vector<uint8_t>& out) {
+            return m_addressKeyIsEcc
+                ? ProtonPGP::DecryptMessageEcc(msg, m_addressKeyEcc, out)
+                : ProtonPGP::DecryptMessage(msg, m_addressKey, out);
+        };
         std::vector<uint8_t> decrypted;
-        bool ok = ProtonPGP::DecryptMessage(sharePassphrase, m_addressKey, decrypted);
+        bool ok = decryptWithAddressKey(sharePassphrase, decrypted);
         if (!ok) {
             std::vector<uint8_t> sharePassBytes;
             if (ProtonPGP::Base64Decode(sharePassphrase, sharePassBytes)) {
                 std::string inner(sharePassBytes.begin(), sharePassBytes.end());
-                ok = ProtonPGP::DecryptMessage(inner, m_addressKey, decrypted);
+                ok = decryptWithAddressKey(inner, decrypted);
             }
         }
         if (!ok) {

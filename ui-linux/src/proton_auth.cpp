@@ -1049,7 +1049,8 @@ void ProtonAuthService::stepAuthenticate(const QString &modHex, const QString &s
         m_accessToken  = j["AccessToken"].toString();
         m_refreshToken = j["RefreshToken"].toString();
         m_expiresAt    = QDateTime::currentSecsSinceEpoch() + j["ExpiresIn"].toInteger(3600);
-        int twoFa = j["TwoFactor"].toObject()["Enabled"].toInt();
+        // TwoFactor is a plain integer bitmask (1=TOTP, 2=FIDO2), not a nested object.
+        int twoFa = j["TwoFactor"].toInt();
         if (twoFa & 1) {
             emit statusMessage("Two-factor authentication required.");
             emit needsTwoFactor();
@@ -1209,6 +1210,24 @@ void ProtonAuthService::stepFetchShares()
     });
 }
 
+// Derive the X25519 public point from a raw 32-byte private scalar via OpenSSL.
+// Used so the token file carries the public key alongside the private one --
+// the native Drive provider's Windows/BCrypt ECDH path requires both.
+static QByteArray x25519PublicFromPrivate(const QByteArray &priv)
+{
+    if (priv.size() != 32) return {};
+    EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr,
+                                                    (const unsigned char *)priv.constData(), 32);
+    if (!pkey) return {};
+    unsigned char pub[32];
+    size_t pubLen = sizeof(pub);
+    QByteArray result;
+    if (EVP_PKEY_get_raw_public_key(pkey, pub, &pubLen) == 1 && pubLen == 32)
+        result = QByteArray((const char *)pub, 32);
+    EVP_PKEY_free(pkey);
+    return result;
+}
+
 void ProtonAuthService::stepWriteToken(const QString &shareId, const QString &rootLinkId)
 {
     emit statusMessage("Saving token...");
@@ -1223,13 +1242,19 @@ void ProtonAuthService::stepWriteToken(const QString &shareId, const QString &ro
     tok["root_link_id"]  = rootLinkId;
     tok["address_email"] = m_addrEmail;
     if (m_addrKey.isEcc) {
-        tok["address_key_type"]    = QString("ecc");
-        tok["address_key_x25519"]  = toB64(m_addrKey.x25519Priv);
-        tok["address_key_ed25519"] = toB64(m_addrKey.ed25519Priv);
-        tok["address_key_oid"]     = toB64(m_addrKey.oid);
-        tok["address_kdf_hash"]    = (int)m_addrKey.kdfHashAlgo;
-        tok["address_kdf_cipher"]  = (int)m_addrKey.kdfCipherAlgo;
-        tok["address_key_fp"]      = toB64(m_addrKey.fingerprint);
+        // Field names match the Windows token writer (ProtonSrpService.cs) so the
+        // shared native provider's LoadProtonFields() works identically on both.
+        tok["address_key_type"]     = QString("ecc");
+        tok["address_x25519_priv"]  = toB64(m_addrKey.x25519Priv);
+        tok["address_x25519_pub"]   = toB64(x25519PublicFromPrivate(m_addrKey.x25519Priv));
+        tok["address_ed25519_priv"] = toB64(m_addrKey.ed25519Priv);
+        tok["address_key_fp"]       = toB64(m_addrKey.fingerprint);
+        // oid/kdf params: only this Qt app's own decryptPgpMessage() (used by
+        // listRemoteApps/deleteAppFolder) reads these back; the shared native
+        // provider (proton_pgp.cpp) hardcodes the equivalent Curve25519 constants.
+        tok["address_key_oid"]    = toB64(m_addrKey.oid);
+        tok["address_kdf_hash"]   = (int)m_addrKey.kdfHashAlgo;
+        tok["address_kdf_cipher"] = (int)m_addrKey.kdfCipherAlgo;
     } else {
         tok["address_key_type"] = QString("rsa");
         tok["address_key_n"]    = toB64(m_addrKey.n);
@@ -1305,8 +1330,8 @@ bool ProtonAuthService::loadTokenFile(const QString &tokenPath)
     if (keyType == "ecc") {
         m_addrKey               = {};
         m_addrKey.isEcc         = true;
-        m_addrKey.x25519Priv    = fromB64(tok["address_key_x25519"].toString());
-        m_addrKey.ed25519Priv   = fromB64(tok["address_key_ed25519"].toString());
+        m_addrKey.x25519Priv    = fromB64(tok["address_x25519_priv"].toString());
+        m_addrKey.ed25519Priv   = fromB64(tok["address_ed25519_priv"].toString());
         m_addrKey.oid           = fromB64(tok["address_key_oid"].toString());
         m_addrKey.kdfHashAlgo   = (uint8_t)tok["address_kdf_hash"].toInt(8);
         m_addrKey.kdfCipherAlgo = (uint8_t)tok["address_kdf_cipher"].toInt(9);

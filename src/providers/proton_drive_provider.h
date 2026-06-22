@@ -41,8 +41,10 @@ protected:
     // ── CloudProviderBase hooks ────────────────────────────────────────────────
     const char* LogTag()            const override { return "[Proton]"; }
     const char* ProviderTag()       const override { return "[ProtonProvider]"; }
-    const char* ApiHost()           const override { return "api.proton.me"; }
-    const char* TokenEndpointHost() const override { return "api.proton.me"; }
+    // api.proton.me does not resolve in DNS -- mail.proton.me is the actual
+    // API host (matches what both UI auth flows already use successfully).
+    const char* ApiHost()           const override { return "mail.proton.me"; }
+    const char* TokenEndpointHost() const override { return "mail.proton.me"; }
     const char* TokenEndpointPath() const override { return "/auth/v4/refresh"; }
     const char* AuthFailureName()   const override { return "Proton Drive"; }
     const char* RefreshContentType() const override { return "application/json"; }
@@ -65,9 +67,17 @@ private:
 
     // ── Address key and share key (lazily loaded/decrypted) ───────────────────
     // m_addressKey is populated directly from raw RSA component fields in the token
-    // file (address_key_n/e/d/p/q/dp/dq/qi, base64 big-endian MPI bytes).
+    // file (address_key_n/e/d/p/q/dp/dq/qi, base64 big-endian MPI bytes). Newer
+    // Proton accounts have an ECC (X25519) address key instead -- in that case
+    // m_addressKeyIsEcc is set and m_addressKeyEcc is populated from
+    // address_x25519_priv/_pub + address_key_fp. Either way, all node keys in the
+    // share's key chain remain RSA-2048; the address key is only used to decrypt
+    // the share passphrase (GetRootFolderNode) and to sign new node keys
+    // (GenerateNodeKey, RSA-only -- signing is skipped gracefully for ECC).
     bool m_keysLoaded = false;
+    bool m_addressKeyIsEcc = false;
     ProtonPGP::RsaKeyPair m_addressKey;
+    ProtonPGP::EccKeyPair m_addressKeyEcc;
 
     bool m_shareKeyLoaded = false;
     ProtonPGP::RsaKeyPair m_shareKeyPair;

@@ -104,9 +104,10 @@ internal static class ProtonSrpService
                 new AuthenticationHeaderValue("Bearer", accessToken);
 
             // ── Step 3b: Two-factor authentication ────────────────────────────
+            // TwoFactor is a plain integer bitmask (1=TOTP, 2=FIDO2), not a nested object.
             int twoFaEnabled = auth.TryGetProperty("TwoFactor", out var tf)
-                && tf.TryGetProperty("Enabled", out var tfEnabled)
-                ? tfEnabled.GetInt32() : 0;
+                && tf.ValueKind == JsonValueKind.Number
+                ? tf.GetInt32() : 0;
 
             if ((twoFaEnabled & 1) == 0 && (twoFaEnabled & 2) != 0)
             {
@@ -309,6 +310,7 @@ internal static class ProtonSrpService
                 if (addrKey.X25519Pub   != null) tokenObj["address_x25519_pub"]   = ToB64(addrKey.X25519Pub);
                 if (addrKey.Ed25519Priv != null) tokenObj["address_ed25519_priv"] = ToB64(addrKey.Ed25519Priv);
                 if (addrKey.Ed25519Pub  != null) tokenObj["address_ed25519_pub"]  = ToB64(addrKey.Ed25519Pub);
+                if (addrKey.Fingerprint != null) tokenObj["address_key_fp"]       = ToB64(addrKey.Fingerprint);
             }
             else
             {
@@ -549,6 +551,11 @@ internal static class ProtonSrpService
         public bool IsEcc;
         public byte[]? X25519Priv, X25519Pub, Ed25519Priv, Ed25519Pub;
 
+        // SHA-1 fingerprint (20 bytes) of the X25519 encryption subkey's public
+        // packet. Required by the native Drive provider's RFC 6637 ECDH KDF when
+        // decrypting messages encrypted to this key (e.g. the Drive share passphrase).
+        public byte[]? Fingerprint;
+
         // RSA key material for token file (legacy/fallback)
         public byte[]? N, E, D, P, Q, Dp, Dq, Qi;
     }
@@ -605,6 +612,7 @@ internal static class ProtonSrpService
                     result.IsEcc = true;
                     result.X25519Priv = x25519.GetEncoded();
                     result.X25519Pub  = ((X25519PublicKeyParameters)x25519.GeneratePublicKey()).GetEncoded();
+                    result.Fingerprint = sk.PublicKey.GetFingerprint();
                     result.EncryptionSubkey = pk; // X25519 is the encryption subkey
                 }
                 else if (pk.Key is Ed25519PrivateKeyParameters ed25519)
