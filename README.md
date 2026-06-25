@@ -60,7 +60,7 @@ Edit your SLSsteam config, set DisableCloud to No.
 
 Open the CloudRedirect app, sign into a provider.
 
-Edit your SLS config. The games you want to sync must be specified under AdditionalApps in your SLS config. This requirement will go away in the future. Make sure DisableCloud is set to No in the config.
+Edit your SLS config. The games you want to sync must be specified under AdditionalApps in your SLS config. This requirement will go away in the future. 
 
 Now launch Steam and watch your games sync!
 
