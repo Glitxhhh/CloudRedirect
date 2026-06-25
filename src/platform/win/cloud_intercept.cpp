@@ -76,33 +76,33 @@ static constexpr uint32_t EMSG_CLIENT_PICSPRODUCTINFO = 8903;
 //   a5 ([rsp+28h]) = output depot vector (DLC/shared depots)
 // Depot vectors: *(QWORD*)vec = array base, *(int*)(vec+16) = count
 // Each entry is 32 bytes: {uint32 depotId, uint32 appId, uint64 manifestId, ...}
-static constexpr uintptr_t SC_RVA_BUILD_DEPOT_DEPENDENCY = 0x4AC9B0;
+static constexpr uintptr_t SC_RVA_BUILD_DEPOT_DEPENDENCY = 0x4B13A0;
 
 static constexpr size_t SC_BDD_STOLEN_BYTES = 14;  // first 14 bytes of prologue
 
 // steamclient64.dll RVAs for CCMInterface discovery
 // IDA image base: 0x138000000
-// qword_1397A70E8 = global CSteamEngine* pointer
-static constexpr uintptr_t SC_RVA_GLOBAL_ENGINE     = 0x17C2D08;
+// qword_1397CC738 = global CSteamEngine* pointer
+static constexpr uintptr_t SC_RVA_GLOBAL_ENGINE     = 0x17CC738;
 // CCMInterface vtable RVA (for validation)
-static constexpr uintptr_t SC_RVA_CCMINTERFACE_VT   = 0x126C518;
-// sub_138D199E0 = CNetPacket->CProtoBufNetPacket wrapper
-static constexpr uintptr_t SC_RVA_WRAP_PACKET       = 0xCF7960;
-// sub_138D263B0 = CJobMgr::BRouteMsgToJob
-static constexpr uintptr_t SC_RVA_BROUTEMSG         = 0xD03970;
-// sub_1380EB760 = Release wrapped packet (CProtoBufNetPacket ref-count release)
-static constexpr uintptr_t SC_RVA_RELEASE_WRAPPED   = 0x0EC010;
+static constexpr uintptr_t SC_RVA_CCMINTERFACE_VT   = 0x12737D8;
+// sub_138CFEAB0 = CNetPacket->CProtoBufNetPacket wrapper
+static constexpr uintptr_t SC_RVA_WRAP_PACKET       = 0xCFEAB0;
+// sub_138D0A310 = CJobMgr::BRouteMsgToJob
+static constexpr uintptr_t SC_RVA_BROUTEMSG         = 0xD0A310;
+// sub_1380EC350 = Release wrapped packet (CProtoBufNetPacket ref-count release)
+static constexpr uintptr_t SC_RVA_RELEASE_WRAPPED   = 0x0EC350;
 
 // CClientUnifiedServiceTransport vtable (RTTI resolves at runtime; RVA is fallback)
-static constexpr uintptr_t SC_RVA_SERVICE_TRANSPORT_VT = 0x1249C10;
+static constexpr uintptr_t SC_RVA_SERVICE_TRANSPORT_VT = 0x1250EA0;
 // protobuf ParseFromArray, 3-arg (msgObj, data, int size)
-static constexpr uintptr_t SC_RVA_PARSE_FROM_ARRAY  = 0xBC5940;
-// sub_138BE7A40 = protobuf SerializeToArray (writes body to raw bytes)
-static constexpr uintptr_t SC_RVA_SERIALIZE_TO_ARRAY = 0xBC5D50;
+static constexpr uintptr_t SC_RVA_PARSE_FROM_ARRAY  = 0xBCCBC0;
+// sub_138BCCFD0 = protobuf SerializeToArray (writes body to raw bytes)
+static constexpr uintptr_t SC_RVA_SERIALIZE_TO_ARRAY = 0xBCCFD0;
 // CUser playtime state helpers
-static constexpr uintptr_t SC_RVA_GET_APP_MINUTES_PLAYED_DATA = 0x9BB3C0;
-static constexpr uintptr_t SC_RVA_FLUSH_APP_MINUTES_PLAYED = 0x9CB870;
-static constexpr uintptr_t SC_RVA_SET_APP_LAST_PLAYED_TIME = 0x9CE6A0;
+static constexpr uintptr_t SC_RVA_GET_APP_MINUTES_PLAYED_DATA = 0x9BFA40;
+static constexpr uintptr_t SC_RVA_FLUSH_APP_MINUTES_PLAYED = 0x9CFEF0;
+static constexpr uintptr_t SC_RVA_SET_APP_LAST_PLAYED_TIME = 0x9D2D20;
 // CSteamEngine layout offsets
 static constexpr uint32_t ENGINE_OFF_JOBMGR          = 592;    // CJobMgr embedded at CSteamEngine+592
 static constexpr uint32_t ENGINE_OFF_GLOBAL_HANDLE   = 3144;  // uint32_t: global user handle
@@ -190,14 +190,64 @@ static_assert(offsetof(JobRouteInfo, flags) == 20, "");
 // This function takes rcx = pointer-to-pointer, reads *rcx to get a pointer,
 // then does InterlockedIncrement64 on that second pointer.
 // RecvPkt calls this with &unk_139797BD8 before calling BRouteMsgToJob.
-static constexpr uintptr_t SC_RVA_REFCOUNT_HELPER   = 0xDBBFD0;
+static constexpr uintptr_t SC_RVA_REFCOUNT_HELPER   = 0xDC2D70;
 // Global that holds the pointer-to-counter for the refcount helper
-static constexpr uintptr_t SC_RVA_REFCOUNT_GLOBAL   = 0x17B2A18;
-// sub_138D28CD0 = CUtlSortedVector::Find (looks up a CJob by jobId)
-static constexpr uintptr_t SC_RVA_FIND_JOB          = 0xD06410;
+static constexpr uintptr_t SC_RVA_REFCOUNT_GLOBAL   = 0x17B7E38;
+// sub_138D0CDB0 = CUtlSortedVector::Find (looks up a CJob by jobId)
+static constexpr uintptr_t SC_RVA_FIND_JOB          = 0xD0CDB0;
+// g_pJobCur (qword_1397E9CC0) - pointer to currently executing CJob on this coroutine
+static constexpr uintptr_t SC_RVA_JOBCUR_GLOBAL      = 0x17E9CC0;
 
 // SEH exception filter for crash diagnostics
 static thread_local uintptr_t s_crashFaultAddr = 0;
+
+// ===== CRASH DIAGNOSTIC TRACE =====
+// High-resolution lock-free trace buffer for diagnosing the BCheckForJobTimeouts
+// use-after-free crash. Captures thread ID, g_pJobCur, sequence number, and
+// microsecond timestamps on every vtable hook entry/exit.
+static std::atomic<uint64_t> g_traceSeq{0};
+static LARGE_INTEGER g_tracePerfFreq;
+static bool g_traceInitialized = false;
+
+static void TraceInit() {
+    QueryPerformanceFrequency(&g_tracePerfFreq);
+    g_traceInitialized = true;
+}
+
+// Cached pointer to g_pJobCur (resolved lazily on first use).
+static uintptr_t* g_pJobCurPtr = nullptr;
+
+// Read g_pJobCur from steamclient64 global. Returns 0 if unavailable.
+static uintptr_t ReadJobCur() {
+    if (!g_pJobCurPtr) return 0;
+    __try {
+        return *g_pJobCurPtr;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Get microsecond timestamp since process start
+static uint64_t TraceUsec() {
+    if (!g_traceInitialized) return 0;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart * 1000000LL / g_tracePerfFreq.QuadPart);
+}
+
+// Emit a single diagnostic trace line. Format:
+//   [HH:MM:SS] [TRACE] seq=N tid=XXXX us=YYYYY job=ZZZZ event
+// The LOG() macro already serializes via mutex, and this is a crash diagnostic
+// (not a hot loop), so direct LOG() is fine.
+#define DIAG(fmt, ...) do { \
+    uint64_t _seq = g_traceSeq.fetch_add(1, std::memory_order_relaxed); \
+    uint64_t _us  = TraceUsec(); \
+    uintptr_t _jc = ReadJobCur(); \
+    DWORD _tid    = GetCurrentThreadId(); \
+    LOG("[DIAG] seq=%llu tid=%lu us=%llu job=%p " fmt, \
+        _seq, _tid, _us, (void*)_jc, ##__VA_ARGS__); \
+} while(0)
+// ===== END CRASH DIAGNOSTIC TRACE =====
 
 // Forward declarations
 static void InstallServiceMethodHook();
@@ -1258,9 +1308,14 @@ static std::optional<RpcResult> DispatchCloudRpc(
 static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* methodName,
                                                  void* requestBody, void* responseBody, int* flags) {
     HookGuard guard;
-    if (g_shuttingDown.load(std::memory_order_acquire))
+    const char* safeName4 = methodName ? methodName : "(null)";
+    DIAG("S4-ENTER this=%p method=%s reqBody=%p respBody=%p", thisptr, safeName4, requestBody, responseBody);
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        DIAG("S4-EXIT-SHUTDOWN method=%s -> passthrough(yield)", safeName4);
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
+    }
     if (!methodName) {
+        DIAG("S4-EXIT-NULL -> passthrough(yield)");
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
 
@@ -1289,6 +1344,7 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
     }
 
     if (strncmp(methodName, "Cloud.", 6) != 0) {
+        DIAG("S4-EXIT-NOTCLOUD method=%s -> passthrough(yield)", methodName);
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
 
@@ -1296,6 +1352,7 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
     bool isSlot4Rpc = (strcmp(methodName, RPC_BEGIN_UPLOAD) == 0 || strcmp(methodName, RPC_COMMIT_UPLOAD) == 0 ||
                        strcmp(methodName, RPC_FILE_DOWNLOAD) == 0 || strcmp(methodName, RPC_DELETE_FILE) == 0);
     if (!isSlot4Rpc) {
+        DIAG("S4-EXIT-NOTOURS method=%s -> passthrough(yield)", methodName);
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
 
@@ -1327,10 +1384,43 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
     }
 
     if (!isNamespace) {
+        DIAG("S4-EXIT-NOTNS method=%s app=%u -> passthrough(yield)", methodName, appId);
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
 
+    // FileDownload: call original first (yields), then patch response with our URL.
+    if (strcmp(methodName, RPC_FILE_DOWNLOAD) == 0) {
+        DIAG("S4-CALLORIG method=%s app=%u -> yielding to Valve", methodName, appId);
+        bool origResult = g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
+        DIAG("S4-ORIGRET method=%s app=%u result=%d -> patching", methodName, appId, origResult);
+        LOG("[Slot4] FileDownload app=%u: original returned %d, patching response", realAppId, origResult);
+
+        auto dispatched = DispatchCloudRpc(methodName, realAppId, innerFields);
+        if (!dispatched.has_value()) {
+            return origResult;
+        }
+        auto& result = *dispatched;
+
+        if (responseBody && result.body.Size() > 0) {
+            if (!ParseBytesToBody(responseBody, result.body.Data().data(), result.body.Size())) {
+                LOG("[Slot4] FileDownload: ParseFromArray failed, keeping original response");
+                return origResult;
+            }
+        }
+        if (flags) {
+            flags[2] = 1;
+            flags[3] = result.eresult;
+            flags[4] = 0;
+        }
+        DIAG("S4-EXIT-PATCHED method=%s app=%u eresult=%d bodyLen=%zu",
+             methodName, realAppId, result.eresult, result.body.Size());
+        LOG("[Slot4] FileDownload app=%u: patched (eresult=%d, %zu bytes)",
+            realAppId, result.eresult, result.body.Size());
+        return true;
+    }
+
     // NAMESPACE APP: handle locally, synchronously
+    DIAG("S4-INTERCEPT method=%s app=%u reqLen=%zu", methodName, appId, reqBytes.size());
     LOG("[Slot4] INTERCEPT %s app=%u (%zu bytes):", methodName, appId, reqBytes.size());
 #ifdef DEBUG_VERBOSE_LOGGING
     SpyLogFields("[Slot4-REQ]", reqBytes.data(), (uint32_t)reqBytes.size());
@@ -1367,6 +1457,8 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
         flags[4] = 0;  // error_message = "" (null terminator)
     }
 
+    DIAG("S4-EXIT-SYNC method=%s app=%u eresult=%d bodyLen=%zu -> return true (NO YIELD)",
+         methodName, realAppId, result.eresult, result.body.Size());
     LOG("[Slot4] %s handled synchronously", methodName);
     return true;
 }
@@ -1375,9 +1467,14 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
 static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
                                            void* request, void* response, int64_t* flags) {
     HookGuard guard;
-    if (g_shuttingDown.load(std::memory_order_acquire))
+    const char* safeName = methodName ? methodName : "(null)";
+    DIAG("S5-ENTER this=%p method=%s req=%p resp=%p", thisptr, safeName, request, response);
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        DIAG("S5-EXIT-SHUTDOWN method=%s -> passthrough", safeName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
+    }
     if (!methodName) {
+        DIAG("S5-EXIT-NULL method -> passthrough");
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
@@ -1409,6 +1506,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
     }
 
     if (strncmp(methodName, "Cloud.", 6) != 0) {
+        DIAG("S5-EXIT-NOTCLOUD method=%s -> passthrough(yield)", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
@@ -1425,10 +1523,12 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
                        strcmp(methodName, RPC_EXIT_SYNC) == 0 || strcmp(methodName, RPC_CONFLICT) == 0 ||
                        strcmp(methodName, RPC_TRANSFER_REPORT) == 0);
     if (!isCloudRpc) {
+        DIAG("S5-EXIT-NOTOURS method=%s -> passthrough(yield)", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
     if (!request || !response) {
+        DIAG("S5-EXIT-NULLARG method=%s req=%p resp=%p -> passthrough(yield)", methodName, request, response);
         LOG("[VtHook] %s: null request/response, passing through", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
@@ -1466,9 +1566,51 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
     if (!isNamespace) {
         // Not a namespace app - pass through to real Steam servers
         // Suppress log for high-frequency non-namespace apps (e.g. 2371090 = Steam Game Notes)
-        if (appId != 2371090)
+        if (appId != 2371090) {
+            DIAG("S5-EXIT-NOTNS method=%s app=%u -> passthrough(yield)", methodName, appId);
             LOG("[VtHook] %s app=%u: not namespace, passing through", methodName, appId);
+        }
         return g_originalSlot5(thisptr, methodName, request, response, flags);
+    }
+
+    // FileDownload: call original first (yields), then patch response with our URL.
+    if (strcmp(methodName, RPC_FILE_DOWNLOAD) == 0) {
+        DIAG("S5-CALLORIG method=%s app=%u -> yielding to Valve", methodName, appId);
+        bool origResult = g_originalSlot5(thisptr, methodName, request, response, flags);
+        DIAG("S5-ORIGRET method=%s app=%u result=%d -> patching", methodName, appId, origResult);
+        LOG("[VtHook] FileDownload app=%u: original returned %d, patching response", realAppId, origResult);
+
+        auto dispatched = DispatchCloudRpc(methodName, realAppId, innerFields);
+        if (!dispatched.has_value()) {
+            return origResult;
+        }
+        auto& result = *dispatched;
+
+        void* respHeader = *(void**)((uintptr_t)response + 40);
+        void* respBody = *(void**)((uintptr_t)response + 48);
+        if (!respHeader || !respBody) {
+            LOG("[VtHook] FileDownload: null respHeader/respBody, keeping original");
+            return origResult;
+        }
+
+        if (result.body.Size() > 0) {
+            if (!ParseBytesToBody(respBody, result.body.Data().data(), result.body.Size())) {
+                LOG("[VtHook] FileDownload: ParseFromArray failed, keeping original");
+                return origResult;
+            }
+        }
+        SEH_WriteResponseHeader(respHeader, result.eresult);
+        if (flags) {
+            int32_t* f32 = reinterpret_cast<int32_t*>(flags);
+            f32[0] = 0;
+            f32[2] = 0;
+            f32[3] = result.eresult;
+        }
+        DIAG("S5-EXIT-PATCHED method=%s app=%u eresult=%d bodyLen=%zu",
+             methodName, realAppId, result.eresult, result.body.Size());
+        LOG("[VtHook] FileDownload app=%u: patched (eresult=%d, %zu bytes)",
+            realAppId, result.eresult, result.body.Size());
+        return true;
     }
 
     // NAMESPACE APP: handle locally
@@ -1555,6 +1697,8 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         f32[3] = result.eresult;
     }
 
+    DIAG("S5-EXIT-SYNC method=%s app=%u eresult=%d bodyLen=%zu -> return true (NO YIELD)",
+         methodName, realAppId, result.eresult, result.body.Size());
     LOG("[VtHook] SUCCESS: %s app=%u handled locally (response %zu bytes)",
         methodName, realAppId, result.body.Size());
     return true;
@@ -1832,6 +1976,7 @@ static void UploadPlaytimeOnExit(uint32_t appId) {
 // request is a CProtoBufMsg* with body at +48, header at +40
 static bool __fastcall NotificationWrapperHook(void* thisptr, const char* methodName, void* request) {
     HookGuard guard;
+    DIAG("S8-ENTER this=%p method=%s", thisptr, methodName ? methodName : "(null)");
     if (g_shuttingDown.load(std::memory_order_acquire))
         return g_originalSlot8(thisptr, methodName, request);
     if (!methodName) {
@@ -1943,6 +2088,7 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
 // bodyObj is the raw protobuf body (NOT wrapped in CProtoBufMsg)
 static bool __fastcall NotificationDirectHook(void* thisptr, const char* methodName, void* bodyObj, int* flags) {
     HookGuard guard;
+    DIAG("S7-ENTER this=%p method=%s", thisptr, methodName ? methodName : "(null)");
     if (g_shuttingDown.load(std::memory_order_acquire))
         return g_originalSlot7(thisptr, methodName, bodyObj, flags);
     if (!methodName) {
@@ -2206,6 +2352,10 @@ static void InstallServiceMethodHook() {
 
 static void InstallServiceMethodHookLocked() {
     if (g_vtableHookInstalled.load(std::memory_order_acquire) || !g_steamClientBase) return;
+
+    // Resolve g_pJobCur pointer for crash diagnostics (once)
+    if (!g_pJobCurPtr)
+        g_pJobCurPtr = (uintptr_t*)(g_steamClientBase + SC_RVA_JOBCUR_GLOBAL);
 
     // Validate Parse/Serialize RVAs before relying on them; a Steam update can repoint these into garbage.
     auto candidateParse     = (ParseFromArrayFn)(g_steamClientBase + SC_RVA_PARSE_FROM_ARRAY);
@@ -2512,6 +2662,7 @@ static __int64 __fastcall BuildDepotDependencyHook(__int64* a1, unsigned int a2,
 // RecvPkt monitor hook (logging + Approach D injection drain)
 static int64_t __fastcall RecvPktMonitorHook(void* thisptr, CNetPacket* pkt) {
     HookGuard guard;
+    DIAG("RECV-ENTER this=%p pkt=%p", thisptr, (void*)pkt);
     if (g_shuttingDown.load(std::memory_order_acquire))
         return g_originalRecvPkt(thisptr, pkt);
     // Drain on the network-recv thread (valid Coroutine_Continue TLS).
@@ -3146,7 +3297,7 @@ static void UploadLuaOnShutdown() {
 }
 
 // Supported Steam client versions - patches and RVAs are only valid for these builds. Index 0 is the newest.
-static constexpr uint64_t SUPPORTED_STEAM_VERSIONS[] = { 1781041600ULL, 1780352834ULL, 1779918128ULL, 1779486452ULL, 1778281814ULL };
+static constexpr uint64_t SUPPORTED_STEAM_VERSIONS[] = { 1782344391ULL, 1782257239ULL, 1781041600ULL, 1780352834ULL, 1779918128ULL, 1779486452ULL, 1778281814ULL };
 
 static bool IsSupportedSteamVersion(uint64_t v) {
     for (uint64_t s : SUPPORTED_STEAM_VERSIONS)
@@ -3680,6 +3831,7 @@ static void TryAutoUpdateDll() {
 }
 
 void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCallback) {
+    TraceInit();
     g_notifyCallback = notifyCallback;
     g_steamPath = steamPath;
     if (!g_steamPath.empty() && g_steamPath.back() != '\\')

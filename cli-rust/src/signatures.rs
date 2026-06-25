@@ -263,6 +263,48 @@ fn p3_resolver(data: &[u8], hit: usize) -> i64 {
     -1
 }
 
+fn p1_validator_v2(data: &[u8], hit: usize) -> bool {
+    (data[hit + 15] == 0x0F && data[hit + 16] == 0x86)
+        || (data[hit + 15] == 0x90 && data[hit + 16] == 0xE9)
+}
+
+fn p2_validator_v2(data: &[u8], hit: usize) -> bool {
+    (data[hit + 19] == 0x8B && data[hit + 20] == 0x0D)
+        || (data[hit + 19] == 0x31 && data[hit + 20] == 0xC9)
+}
+
+fn p4_validator_v2(data: &[u8], hit: usize) -> bool {
+    (data[hit + 2] == 0x0F && data[hit + 3] == 0x95 && data[hit + 4] == 0xC0)
+        || (data[hit + 2] == 0xB0 && data[hit + 3] == 0x01 && data[hit + 4] == 0x90)
+}
+
+fn p7_validator_v2(data: &[u8], hit: usize) -> bool {
+    (data[hit + 3] == 0x75 && data[hit + 8] == 0x74)
+        || (data[hit + 3] == 0x90 && data[hit + 8] == 0xEB)
+}
+
+fn p3_resolver_v2(data: &[u8], hit: usize) -> i64 {
+    let search_start = hit + 8;
+    let search_end = (search_start + 20).min(data.len());
+    let mut i = search_start;
+    while i + 5 < search_end {
+        if data[i] == 0x89 && data[i + 1] == 0x3D {
+            return i as i64;
+        }
+        if data[i] == 0x90
+            && data[i + 1] == 0x90
+            && data[i + 2] == 0x90
+            && data[i + 3] == 0x90
+            && data[i + 4] == 0x90
+            && data[i + 5] == 0x90
+        {
+            return i as i64;
+        }
+        i += 1;
+    }
+    -1
+}
+
 fn has_bytes(bytes: &[u8], pos: i64, expected: &[u8]) -> bool {
     if pos < 0 || pos as usize + expected.len() > bytes.len() {
         return false;
@@ -278,7 +320,7 @@ fn skip_optional_bridge(bytes: &[u8], pos: i64) -> i64 {
     }
 }
 
-fn p4_resolver(data: &[u8], hit: usize) -> i64 {
+fn p4_resolver_v1(data: &[u8], hit: usize) -> i64 {
     let mut pos = hit as i64 + 3;
     pos = skip_optional_bridge(data, pos);
     if !has_bytes(data, pos, &[0x0F, 0x84]) {
@@ -491,15 +533,87 @@ pub fn payload_p123_defs() -> Vec<PatternPatch> {
     ]
 }
 
-// Payload setup patches P4/P5/P6
-
-pub fn payload_setup_defs() -> Vec<PatternPatch> {
+/// V2 P1/P2/P3: new plain .text payload (no obfuscator, restructured code).
+pub fn payload_p123_defs_v2() -> Vec<PatternPatch> {
     vec![
-        // P4: force activation flag to 1.
+        // P1 V2: cloud rewrite jbe -> nop jmp.
         PatternPatch {
             wildcard_start: 2,
             wildcard_len: 4,
-            patch_site_resolver: Some(p4_resolver),
+            validator: Some(p1_validator_v2),
+            ..PatternPatch::new(
+                "P1 (cloud rewrite skip)",
+                &[
+                    0x85, 0xC0, 0x0F, 0x85, 0x00, 0x00, 0x00, 0x00,
+                    0x44, 0x39, 0x25, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00,
+                ],
+                &[
+                    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+                    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00,
+                ],
+                15,
+                &[0x0F, 0x86, 0x00, 0x00, 0x00, 0x00],
+                &[0x90, 0xE9, 0x00, 0x00, 0x00, 0x00],
+                ScanRegion::Text,
+            )
+        },
+        // P2 V2: zero proxy appid load. Registers changed:
+        // mov r15,rax / mov r8,rsi (was mov rsi,rax / mov r8,rdi).
+        // lea rdx,[r15+rdi] (was lea rdx,[rsi+rdi]).
+        PatternPatch {
+            wildcard_start: 2,
+            wildcard_len: 4,
+            validator: Some(p2_validator_v2),
+            ..PatternPatch::new(
+                "P2 (proxy appid zero)",
+                &[
+                    0x4C, 0x8B, 0xF8, 0x4C, 0x8B, 0xC6, 0x48, 0x8B, 0x54, 0x24, 0x30,
+                    0x48, 0x8B, 0xC8, 0xE8, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x49, 0x8D, 0x14, 0x37, 0x48, 0x81, 0xF9, 0x80, 0x00, 0x00, 0x00,
+                ],
+                &[
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                ],
+                19,
+                &[0x8B, 0x0D, 0x00, 0x00, 0x00, 0x00],
+                &[0x31, 0xC9, 0x90, 0x90, 0x90, 0x90],
+                ScanRegion::Text,
+            )
+        },
+        // P3 V2: NOP IPC appid preserve. Anchor changed from C7 40 09
+        // (mov [rax+9],480) to 41 C7 46 09 (mov [r14+9],480). Now in .text.
+        PatternPatch {
+            wildcard_start: 2,
+            wildcard_len: 4,
+            patch_site_resolver: Some(p3_resolver_v2),
+            ..PatternPatch::new(
+                "P3 (IPC appid preserve)",
+                &[0x41, 0xC7, 0x46, 0x09, 0xE0, 0x01, 0x00, 0x00],
+                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+                0,
+                &[0x89, 0x3D, 0x00, 0x00, 0x00, 0x00],
+                &[0x90, 0x90, 0x90, 0x90, 0x90, 0x90],
+                ScanRegion::Text,
+            )
+        },
+    ]
+}
+
+// Payload setup patches P4/P5/P6
+
+/// V1 defs: old payload with obfuscated P4 (E9 bridges).
+pub fn payload_setup_defs_v1() -> Vec<PatternPatch> {
+    vec![
+        PatternPatch {
+            wildcard_start: 2,
+            wildcard_len: 4,
+            patch_site_resolver: Some(p4_resolver_v1),
             ..PatternPatch::new(
                 "P4 (activation flag)",
                 &[0x4D, 0x85, 0xC0],
@@ -508,6 +622,121 @@ pub fn payload_setup_defs() -> Vec<PatternPatch> {
                 &[0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00],
                 &[0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01],
                 ScanRegion::Obfuscated,
+            )
+        },
+        // P7 exists in both old and new payloads.
+        PatternPatch {
+            validator: Some(p7_validator_v2),
+            ..PatternPatch::new(
+                "P7 (activation confirmed)",
+                &[
+                    0x4C, 0x3B, 0xC0, 0x75, 0x17, 0x4D, 0x85, 0xC0,
+                    0x74, 0x09, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x85,
+                    0xC0, 0x75, 0x09, 0xC6, 0x05,
+                ],
+                &[
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                ],
+                3,
+                &[0x75, 0x17, 0x4D, 0x85, 0xC0, 0x74, 0x09],
+                &[0x90, 0x90, 0x4D, 0x85, 0xC0, 0xEB, 0x09],
+                ScanRegion::Text,
+            )
+        },
+        PatternPatch {
+            validator: Some(p5_validator),
+            ..PatternPatch::new(
+                "P5 (GetCookie retry skip)",
+                &[
+                    0x66, 0x48, 0x0F, 0x7E, 0xC7, 0x66, 0x48, 0x0F, 0x7E, 0xCE, 0x48, 0x8D, 0x4D,
+                    0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x85, 0xF6, 0x00,
+                ],
+                &[
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00,
+                ],
+                22,
+                &[0x75],
+                &[0xEB],
+                ScanRegion::Text,
+            )
+        },
+        PatternPatch {
+            validator: Some(p6_validator),
+            ..PatternPatch::new(
+                "P6 (GMRC pattern fix)",
+                &[
+                    0x34, 0x38, 0x20, 0x38, 0x39, 0x20, 0x35, 0x43, 0x20, 0x32, 0x34, 0x20, 0x31,
+                    0x38, 0x20, 0x35, 0x35, 0x20,
+                ],
+                &[
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                ],
+                0,
+                &[
+                    0x34, 0x38, 0x20, 0x38, 0x39, 0x20, 0x35, 0x43, 0x20, 0x32, 0x34, 0x20, 0x31,
+                    0x38, 0x20, 0x35, 0x35, 0x20, 0x35, 0x36, 0x20, 0x35, 0x37, 0x20, 0x34, 0x31,
+                    0x20, 0x35, 0x35, 0x20, 0x34, 0x31, 0x20, 0x35, 0x37, 0x20, 0x34, 0x38, 0x20,
+                    0x38, 0x44, 0x20, 0x36, 0x43, 0x5E, 0x00, 0x00, 0x00,
+                ],
+                &[
+                    0x34, 0x38, 0x20, 0x38, 0x39, 0x20, 0x35, 0x43, 0x20, 0x32, 0x34, 0x20, 0x31,
+                    0x38, 0x20, 0x35, 0x35, 0x20, 0x35, 0x37, 0x20, 0x34, 0x31, 0x20, 0x35, 0x34,
+                    0x20, 0x34, 0x31, 0x20, 0x35, 0x36, 0x20, 0x34, 0x31, 0x20, 0x35, 0x37, 0x20,
+                    0x34, 0x38, 0x20, 0x38, 0x44, 0x20, 0x36, 0x43, 0x00,
+                ],
+                ScanRegion::All,
+            )
+        },
+    ]
+}
+
+/// Current defs: new payload with plain .text P4 (no obfuscator).
+pub fn payload_setup_defs() -> Vec<PatternPatch> {
+    vec![
+        // P4: force activation flag to 1.
+        // New plain .text layout: test edx,edx; setnz al -> mov al,1; nop.
+        PatternPatch {
+            validator: Some(p4_validator_v2),
+            ..PatternPatch::new(
+                "P4 (activation flag)",
+                &[
+                    0x85, 0xD2, 0x00, 0x00, 0x00, 0xEB, 0x02, 0xB0, 0x01, 0x88,
+                    0x47, 0x01,
+                ],
+                &[
+                    0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF,
+                ],
+                2,
+                &[0x0F, 0x95, 0xC0],
+                &[0xB0, 0x01, 0x90],
+                ScanRegion::Text,
+            )
+        },
+        // P7: force activation confirmed flag to 1.
+        // Bypass server-side hash check: jnz->nop+nop, jz->jmp.
+        PatternPatch {
+            validator: Some(p7_validator_v2),
+            ..PatternPatch::new(
+                "P7 (activation confirmed)",
+                &[
+                    0x4C, 0x3B, 0xC0, 0x75, 0x17, 0x4D, 0x85, 0xC0,
+                    0x74, 0x09, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x85,
+                    0xC0, 0x75, 0x09, 0xC6, 0x05,
+                ],
+                &[
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                ],
+                3,
+                &[0x75, 0x17, 0x4D, 0x85, 0xC0, 0x74, 0x09],
+                &[0x90, 0x90, 0x4D, 0x85, 0xC0, 0xEB, 0x09],
+                ScanRegion::Text,
             )
         },
         // P5: skip GetCookie retry.
@@ -673,8 +902,9 @@ mod tests {
     }
 }
 
-/// Locate recvPktGlobal: find `lea rcx, SendPkt`, then the following
-/// `mov cs:qword, rcx` that stores RecvPkt. Returns -1 on miss.
+/// Locate recvPktGlobal: find `lea rcx, SendPkt`, then the nearby
+/// `mov [rip+disp], rcx` that stores the original function pointer.
+/// Backward scan first, forward scan as fallback.
 pub fn find_recv_pkt_global_rva(
     data: &[u8],
     sections: &[PeSection],
@@ -700,19 +930,31 @@ pub fn find_recv_pkt_global_rva(
             i += 1;
             continue;
         }
-        // Forward-scan for `mov cs:qword, rcx` (48 89 0D).
-        let mut j = i + 7;
-        let jend = (i + 0x100).min(search_end) - 7;
-        while j < jend {
+        // Backward-scan for `mov [rip+disp], rcx` (48 89 0D).
+        let bstart = search_start.max(i - 0x100);
+        let mut j = i - 1;
+        while j >= bstart {
             let ju = j as usize;
             if data[ju] == 0x48 && data[ju + 1] == 0x89 && data[ju + 2] == 0x0D {
                 let mov_rel = read_i32(data, ju + 3) as i64;
                 let mov_rva = PeSection::file_offset_to_rva(sections, j);
-                if mov_rva < 0 {
-                    j += 1;
-                    continue;
+                if mov_rva >= 0 {
+                    return mov_rva + 7 + mov_rel;
                 }
-                return mov_rva + 7 + mov_rel;
+            }
+            j -= 1;
+        }
+        // Forward-scan fallback (48 89 xx, modrm rip-relative).
+        let mut j = i + 7;
+        let jend = (i + 0x100).min(search_end) - 7;
+        while j < jend {
+            let ju = j as usize;
+            if data[ju] == 0x48 && data[ju + 1] == 0x89 && (data[ju + 2] & 0xC7) == 0x05 {
+                let mov_rel = read_i32(data, ju + 3) as i64;
+                let mov_rva = PeSection::file_offset_to_rva(sections, j);
+                if mov_rva >= 0 {
+                    return mov_rva + 7 + mov_rel;
+                }
             }
             j += 1;
         }

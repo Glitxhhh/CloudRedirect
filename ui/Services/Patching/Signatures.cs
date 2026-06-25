@@ -210,6 +210,7 @@ namespace CloudRedirect.Services.Patching
 
         // ── Payload patches P1-P3 (cloud redirect disable) ─────────────
 
+        // V1 P1/P2/P3: old obfuscated payload layout.
         public static readonly PatternPatch[] PayloadP123Defs =
         {
             // P1: cloud rewrite jz -> nop jmp. Anchor: 44 8B 3D (r15d global load) +
@@ -306,71 +307,201 @@ namespace CloudRedirect.Services.Patching
             },
         };
 
-        // ── Payload setup patches P4/P5 ────────────────────────────────
-
-        public static readonly PatternPatch[] PayloadSetupDefs =
+        // V2 P1/P2/P3: new plain .text payload (no obfuscator, restructured code).
+        public static readonly PatternPatch[] PayloadP123DefsV2 =
         {
-            // P4: force activation flag to 1. The obfuscator inserts E9 00000000 (jmp $+5)
-            // bridges between instructions. Pattern: test r8,r8 / [bridge] / jz / call / test eax,eax /
-            // [bridge] / jnz / mov [flag],1 / [bridge] / jmp merge / mov [flag],0 (PATCH SITE)
+            // P1 V2: cloud rewrite jbe -> nop jmp. Anchor: test eax,eax; jnz +
+            // cmp [rip+disp],r12d; jbe (PATCH SITE). Unique 17-byte pattern.
             new PatternPatch
             {
-                Name = "P4 (activation flag)",
+                Name = "P1 (cloud rewrite skip)",
                 Pattern = new byte[] {
-                    0x4D, 0x85, 0xC0 // test r8, r8
+                    0x85, 0xC0, 0x0F, 0x85, 0x00, 0x00, 0x00, 0x00,
+                    0x44, 0x39, 0x25, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00 },
+                Mask = new byte[] {
+                    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+                    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00 },
+                PatchOffset = 15,
+                Original    = new byte[] { 0x0F, 0x86, 0x00, 0x00, 0x00, 0x00 },
+                Replacement = new byte[] { 0x90, 0xE9, 0x00, 0x00, 0x00, 0x00 },
+                Region = ScanRegion.Text,
+                WildcardStart = 2, WildcardLen = 4,
+                Validator = (data, hit) =>
+                {
+                    return (data[hit + 15] == 0x0F && data[hit + 16] == 0x86) ||
+                           (data[hit + 15] == 0x90 && data[hit + 16] == 0xE9);
+                },
+            },
+            // P2 V2: zero proxy appid load. Registers changed:
+            // mov r15,rax / mov r8,rsi (was mov rsi,rax / mov r8,rdi).
+            // lea rdx,[r15+rdi] (was lea rdx,[rsi+rdi]).
+            new PatternPatch
+            {
+                Name = "P2 (proxy appid zero)",
+                Pattern = new byte[] {
+                    0x4C, 0x8B, 0xF8,                         // mov r15, rax
+                    0x4C, 0x8B, 0xC6,                         // mov r8, rsi
+                    0x48, 0x8B, 0x54, 0x24, 0x30,             // mov rdx, [rsp+30h]
+                    0x48, 0x8B, 0xC8,                         // mov rcx, rax
+                    0xE8, 0x00, 0x00, 0x00, 0x00,             // call
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,       // PATCH SITE (wildcarded)
+                    0x49, 0x8D, 0x14, 0x37,                   // lea rdx, [r15+rdi]
+                    0x48, 0x81, 0xF9, 0x80, 0x00, 0x00, 0x00  // cmp rcx, 80h
                 },
                 Mask = new byte[] {
-                    0xFF, 0xFF, 0xFF
+                    0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF,
+                    0xFF, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
                 },
+                PatchOffset = 19,
+                Original    = new byte[] { 0x8B, 0x0D, 0x00, 0x00, 0x00, 0x00 },
+                Replacement = new byte[] { 0x31, 0xC9, 0x90, 0x90, 0x90, 0x90 },
+                Region = ScanRegion.Text,
+                WildcardStart = 2, WildcardLen = 4,
+                Validator = (data, hit) =>
+                {
+                    return (data[hit + 19] == 0x8B && data[hit + 20] == 0x0D) ||
+                           (data[hit + 19] == 0x31 && data[hit + 20] == 0xC9);
+                },
+            },
+            // P3 V2: NOP IPC appid preserve. Anchor changed from C7 40 09
+            // (mov [rax+9],480) to 41 C7 46 09 (mov [r14+9],480). Now in .text
+            // (was in obfuscated section).
+            new PatternPatch
+            {
+                Name = "P3 (IPC appid preserve)",
+                Pattern = new byte[] { 0x41, 0xC7, 0x46, 0x09, 0xE0, 0x01, 0x00, 0x00 },
+                Mask    = new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
                 PatchOffset = 0,
-                Original    = new byte[] { 0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00 },
-                Replacement = new byte[] { 0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01 },
-                Region = ScanRegion.Obfuscated,
+                Original    = new byte[] { 0x89, 0x3D, 0x00, 0x00, 0x00, 0x00 },
+                Replacement = new byte[] { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 },
+                Region = ScanRegion.Text,
                 WildcardStart = 2, WildcardLen = 4,
                 PatchSiteResolver = (data, hit) =>
                 {
-                    static bool HasBytes(byte[] bytes, int pos, params byte[] expected)
+                    int searchStart = hit + 8;
+                    int searchEnd = Math.Min(searchStart + 20, data.Length);
+                    for (int i = searchStart; i < searchEnd - 5; i++)
                     {
-                        if (pos < 0 || pos + expected.Length > bytes.Length) return false;
-                        for (int i = 0; i < expected.Length; i++)
-                            if (bytes[pos + i] != expected[i]) return false;
-                        return true;
+                        if (data[i] == 0x89 && data[i + 1] == 0x3D)
+                            return i;
+                        if (data[i] == 0x90 && data[i + 1] == 0x90 &&
+                            data[i + 2] == 0x90 && data[i + 3] == 0x90 &&
+                            data[i + 4] == 0x90 && data[i + 5] == 0x90)
+                            return i;
                     }
-
-                    static int SkipOptionalBridge(byte[] bytes, int pos)
-                    {
-                        return HasBytes(bytes, pos, 0xE9) ? pos + 5 : pos;
-                    }
-
-                    int pos = hit + 3;
-                    pos = SkipOptionalBridge(data, pos);
-                    if (!HasBytes(data, pos, 0x0F, 0x84)) return -1;
-                    pos += 6;
-
-                    if (!HasBytes(data, pos, 0xE8)) return -1;
-                    pos += 5;
-
-                    if (!HasBytes(data, pos, 0x85, 0xC0)) return -1;
-                    pos += 2;
-
-                    pos = SkipOptionalBridge(data, pos);
-                    if (!HasBytes(data, pos, 0x0F, 0x85)) return -1;
-                    pos += 6;
-
-                    if (!HasBytes(data, pos, 0xC6, 0x05)) return -1;
-                    if (pos + 6 >= data.Length || data[pos + 6] != 0x01) return -1;
-                    pos += 7;
-
-                    pos = SkipOptionalBridge(data, pos);
-                    if (!HasBytes(data, pos, 0xE9)) return -1;
-                    pos += 5;
-
-                    if (!HasBytes(data, pos, 0xC6, 0x05)) return -1;
-                    if (pos + 6 >= data.Length) return -1;
-                    byte val = data[pos + 6];
-                    return (val == 0x00 || val == 0x01) ? pos : -1;
+                    return -1;
                 },
             },
+        };
+
+        // ── Payload setup patches P4/P5/P6 ──────────────────────────────
+
+        // V1 P4: old obfuscated layout with E9 bridges.
+        static readonly PatternPatch P4_V1 = new PatternPatch
+        {
+            Name = "P4 (activation flag)",
+            Pattern = new byte[] { 0x4D, 0x85, 0xC0 },
+            Mask = new byte[] { 0xFF, 0xFF, 0xFF },
+            PatchOffset = 0,
+            Original    = new byte[] { 0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00 },
+            Replacement = new byte[] { 0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01 },
+            Region = ScanRegion.Obfuscated,
+            WildcardStart = 2, WildcardLen = 4,
+            PatchSiteResolver = (data, hit) =>
+            {
+                static bool HasBytes(byte[] bytes, int pos, params byte[] expected)
+                {
+                    if (pos < 0 || pos + expected.Length > bytes.Length) return false;
+                    for (int i = 0; i < expected.Length; i++)
+                        if (bytes[pos + i] != expected[i]) return false;
+                    return true;
+                }
+
+                static int SkipOptionalBridge(byte[] bytes, int pos)
+                {
+                    return HasBytes(bytes, pos, 0xE9) ? pos + 5 : pos;
+                }
+
+                int pos = hit + 3;
+                pos = SkipOptionalBridge(data, pos);
+                if (!HasBytes(data, pos, 0x0F, 0x84)) return -1;
+                pos += 6;
+                if (!HasBytes(data, pos, 0xE8)) return -1;
+                pos += 5;
+                if (!HasBytes(data, pos, 0x85, 0xC0)) return -1;
+                pos += 2;
+                pos = SkipOptionalBridge(data, pos);
+                if (!HasBytes(data, pos, 0x0F, 0x85)) return -1;
+                pos += 6;
+                if (!HasBytes(data, pos, 0xC6, 0x05)) return -1;
+                if (pos + 6 >= data.Length || data[pos + 6] != 0x01) return -1;
+                pos += 7;
+                pos = SkipOptionalBridge(data, pos);
+                if (!HasBytes(data, pos, 0xE9)) return -1;
+                pos += 5;
+                if (!HasBytes(data, pos, 0xC6, 0x05)) return -1;
+                if (pos + 6 >= data.Length) return -1;
+                byte val = data[pos + 6];
+                return (val == 0x00 || val == 0x01) ? pos : -1;
+            },
+        };
+
+        // V2 P4: new plain .text layout (no obfuscator). setnz al -> mov al,1; nop.
+        static readonly PatternPatch P4_V2 = new PatternPatch
+        {
+            Name = "P4 (activation flag)",
+            Pattern = new byte[] {
+                0x85, 0xD2, 0x00, 0x00, 0x00, 0xEB, 0x02, 0xB0, 0x01, 0x88, 0x47, 0x01,
+            },
+            Mask = new byte[] {
+                0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            },
+            PatchOffset = 2,
+            Original    = new byte[] { 0x0F, 0x95, 0xC0 },
+            Replacement = new byte[] { 0xB0, 0x01, 0x90 },
+            Region = ScanRegion.Text,
+            Validator = (data, hit) =>
+            {
+                return (data[hit + 2] == 0x0F && data[hit + 3] == 0x95 && data[hit + 4] == 0xC0) ||
+                       (data[hit + 2] == 0xB0 && data[hit + 3] == 0x01 && data[hit + 4] == 0x90);
+            },
+        };
+
+        // P7: force activation confirmed flag. Bypass hash check: jnz->nop+nop, jz->jmp.
+        static readonly PatternPatch P7_V2 = new PatternPatch
+        {
+            Name = "P7 (activation confirmed)",
+            Pattern = new byte[] {
+                0x4C, 0x3B, 0xC0, 0x75, 0x17, 0x4D, 0x85, 0xC0,
+                0x74, 0x09, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x85,
+                0xC0, 0x75, 0x09, 0xC6, 0x05 },
+            Mask = new byte[] {
+                0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF,
+                0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+            PatchOffset = 3,
+            Original    = new byte[] { 0x75, 0x17, 0x4D, 0x85, 0xC0, 0x74, 0x09 },
+            Replacement = new byte[] { 0x90, 0x90, 0x4D, 0x85, 0xC0, 0xEB, 0x09 },
+            Region = ScanRegion.Text,
+            Validator = (data, hit) =>
+            {
+                return (data[hit + 3] == 0x75 && data[hit + 8] == 0x74) ||
+                       (data[hit + 3] == 0x90 && data[hit + 8] == 0xEB);
+            },
+        };
+
+        public static readonly PatternPatch[] PayloadSetupDefs =
+        {
+            P4_V2,
+            P7_V2,
             // P5: skip GetCookie retry. Anchor: paired movq reg,xmm (66 48 0F 7E C7/CE);
             // 18 fixed anchor bytes.
             new PatternPatch
@@ -464,6 +595,14 @@ namespace CloudRedirect.Services.Patching
             },
         };
 
+        public static readonly PatternPatch[] PayloadSetupDefsV1 =
+        {
+            P4_V1,
+            P7_V2, // P7 exists in both old and new payloads
+            PayloadSetupDefs[2], // P5
+            PayloadSetupDefs[3], // P6
+        };
+
         // ── CloudRedirect hook finders ──────────────────────────────────
 
         /// <summary>
@@ -506,12 +645,12 @@ namespace CloudRedirect.Services.Patching
                 var sec = sections[s];
                 if (!sec.IsExecutable) continue;
 
-                int rawEnd = (int)(sec.RawOffset + sec.RawSize);
-                if (rawEnd > data.Length) rawEnd = data.Length;
+                int mappedSize = (int)Math.Min(sec.VirtualSize, sec.RawSize);
+                int mappedEnd = Math.Min((int)sec.RawOffset + mappedSize, data.Length);
                 int rawStart = (int)sec.RawOffset;
 
                 int zeroRun = 0;
-                for (int i = rawEnd - 1; i >= rawStart; i--)
+                for (int i = mappedEnd - 1; i >= rawStart; i--)
                 {
                     if (data[i] == 0)
                         zeroRun++;
@@ -521,7 +660,7 @@ namespace CloudRedirect.Services.Patching
 
                 if (zeroRun >= requiredSize)
                 {
-                    int caveStart = rawEnd - zeroRun;
+                    int caveStart = mappedEnd - zeroRun;
                     return caveStart;
                 }
             }
@@ -529,8 +668,9 @@ namespace CloudRedirect.Services.Patching
         }
 
         /// <summary>
-        /// Locate recvPktGlobal: find `lea rcx, SendPkt` in the hook installer,
-        /// then the following `mov cs:qword, rcx` that stores RecvPkt. Returns -1 on miss.
+        /// Locate recvPktGlobal: find `lea rcx, SendPkt`, then the nearby
+        /// `mov [rip+disp], rcx` that stores the original function pointer.
+        /// Backward scan first, forward scan as fallback.
         /// </summary>
         public static int FindRecvPktGlobalRva(byte[] data, PeSection[] sections,
             int sendPktRva, int searchStart, int searchEnd)
@@ -548,8 +688,8 @@ namespace CloudRedirect.Services.Patching
                 int targetRva = instrRva + 7 + rel;
                 if (targetRva != sendPktRva) continue;
 
-                // Forward-scan for `mov cs:qword, rcx` (48 89 0D).
-                for (int j = i + 7; j < Math.Min(i + 0x100, searchEnd) - 7; j++)
+                // Backward-scan for `mov [rip+disp], rcx` (48 89 0D).
+                for (int j = i - 1; j >= Math.Max(searchStart, i - 0x100); j--)
                 {
                     if (data[j] == 0x48 && data[j + 1] == 0x89 && data[j + 2] == 0x0D)
                     {
@@ -558,6 +698,18 @@ namespace CloudRedirect.Services.Patching
                         if (movRva < 0) continue;
                         int globalRva = movRva + 7 + movRel;
                         return globalRva;
+                    }
+                }
+
+                // Forward-scan fallback (48 89 xx, modrm rip-relative).
+                for (int j = i + 7; j < Math.Min(i + 0x100, searchEnd) - 7; j++)
+                {
+                    if (data[j] == 0x48 && data[j + 1] == 0x89 && (data[j + 2] & 0xC7) == 0x05)
+                    {
+                        int movRel = BitConverter.ToInt32(data, j + 3);
+                        int movRva = PeSection.FileOffsetToRva(sections, j);
+                        if (movRva < 0) continue;
+                        return movRva + 7 + movRel;
                     }
                 }
             }

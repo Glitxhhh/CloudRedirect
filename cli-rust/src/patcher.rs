@@ -210,7 +210,7 @@ impl Patcher {
 
         // 2. Payload cache.
         let mut log = |m: &str| println!("{}", m);
-        let cache_path = match crypto::find_cache_path(&self.steam_path, &mut log) {
+        let mut cache_path = match crypto::find_cache_path(&self.steam_path, &mut log) {
             Some(p) => p,
             None => {
                 self.log("Payload cache not found. Deploying embedded payload..");
@@ -222,12 +222,26 @@ impl Patcher {
         };
 
         self.log("Patching payload (offline setup)..");
-        let (payload, iv) = match self.read_and_decrypt_payload(&cache_path) {
+        let (mut payload, mut iv) = match self.read_and_decrypt_payload(&cache_path) {
             Ok(v) => v,
             Err(e) => return PatchOutcome::fail(e),
         };
 
-        let resolved_setup = match self.resolve_setup_patch_offsets(&payload) {
+        let mut resolved_setup = self.resolve_setup_patch_offsets(&payload);
+
+        // Payload may be corrupted by a prior CR version; try the embedded copy.
+        if resolved_setup.as_ref().map_or(true, |r| r.is_empty()) {
+            if let Some((rec_path, rec_payload, rec_iv)) =
+                self.try_recover_corrupted_payload(&cache_path, version)
+            {
+                cache_path = rec_path;
+                payload = rec_payload;
+                iv = rec_iv;
+                resolved_setup = self.resolve_setup_patch_offsets(&payload);
+            }
+        }
+
+        let resolved_setup = match resolved_setup {
             Some(r) if !r.is_empty() => r,
             _ => {
                 return PatchOutcome::fail(
@@ -383,33 +397,36 @@ impl Patcher {
     /// Resolve payload section bounds: .text and the first non-standard ("obf") section.
     fn resolve_payload_sections(&self, payload: &[u8]) -> Option<(i64, i64, i64, i64)> {
         let sections = PeSection::parse(payload);
-        let text = PeSection::find(&sections, ".text");
+        let text = PeSection::find(&sections, ".text")?;
 
-        const KNOWN: [&str; 7] = [
-            ".text", ".rdata", ".data", ".pdata", ".fptable", ".rsrc", ".reloc",
+        const KNOWN: [&str; 8] = [
+            ".text", ".rdata", ".data", ".pdata", ".fptable", ".rsrc", ".reloc", ".idata",
         ];
         let obf = sections.iter().find(|s| !KNOWN.contains(&s.name.as_str()));
 
-        let (text, obf) = match (text, obf) {
-            (Some(t), Some(o)) => (t, o),
-            _ => {
-                self.log("  Payload: missing expected sections");
-                return None;
-            }
-        };
-
         let t_start = text.raw_offset as i64;
         let t_end = (t_start + text.raw_size as i64).min(payload.len() as i64);
-        let g_start = obf.raw_offset as i64;
-        let g_end = (g_start + obf.raw_size as i64).min(payload.len() as i64);
+        // Fall back to .text bounds if no obfuscated section.
+        let (g_start, g_end) = match obf {
+            Some(o) => {
+                let s = o.raw_offset as i64;
+                (s, (s + o.raw_size as i64).min(payload.len() as i64))
+            }
+            None => (t_start, t_end),
+        };
         Some((t_start, t_end, g_start, g_end))
     }
 
     fn resolve_setup_patch_offsets(&self, payload: &[u8]) -> Option<Vec<PatchEntry>> {
         let (t_start, t_end, g_start, g_end) = self.resolve_payload_sections(payload)?;
         let mut log = |m: &str| println!("{}", m);
-        let defs = signatures::payload_setup_defs();
-        signatures::resolve_pattern_group(payload, &defs, t_start, t_end, g_start, g_end, &mut log)
+        // V2 first, V1 fallback.
+        let new_defs = signatures::payload_setup_defs();
+        if let Some(r) = signatures::resolve_pattern_group(payload, &new_defs, t_start, t_end, g_start, g_end, &mut log) {
+            return Some(r);
+        }
+        let old_defs = signatures::payload_setup_defs_v1();
+        signatures::resolve_pattern_group(payload, &old_defs, t_start, t_end, g_start, g_end, &mut log)
     }
 
     /// Read + AES-decrypt + zlib-inflate the payload cache. Returns (payload, iv).
@@ -464,6 +481,45 @@ impl Patcher {
 
     fn deploy_embedded_payload(&self, version: i64) -> Option<PathBuf> {
         embedded::install_payload(&self.steam_path, version, |m| println!("{}", m))
+    }
+
+    // Sideline a corrupted cache file, deploy the embedded payload, and re-decrypt.
+    fn try_recover_corrupted_payload(
+        &self,
+        old_path: &Path,
+        version: i64,
+    ) -> Option<(PathBuf, Vec<u8>, [u8; 16])> {
+        self.log("  Payload appears corrupted by a previous version. Attempting recovery...");
+
+        let corrupt = file_util::with_extension_suffix(old_path, ".corrupt");
+        if let Err(e) = std::fs::rename(old_path, &corrupt) {
+            self.log(&format!("  Could not rename corrupted payload: {}", e));
+            return None;
+        }
+        self.log(&format!("  Corrupted payload saved to {}", corrupt.display()));
+
+        let new_path = match self.deploy_embedded_payload(version) {
+            Some(p) => p,
+            None => {
+                self.log("  Recovery failed: no embedded payload for this build.");
+                let _ = std::fs::rename(&corrupt, old_path);
+                return None;
+            }
+        };
+
+        match self.read_and_decrypt_payload(&new_path) {
+            Ok((payload, iv)) => {
+                self.log(&format!(
+                    "  Recovery succeeded: clean payload deployed ({} bytes)",
+                    payload.len()
+                ));
+                Some((new_path, payload, iv))
+            }
+            Err(e) => {
+                self.log(&format!("  Recovery failed: {}", e));
+                None
+            }
+        }
     }
 
     fn backup(&self, path: &Path) {

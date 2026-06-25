@@ -33,28 +33,27 @@ static bool QuotaValueLooksValid(uint64_t quota, uint64_t files) {
 
 #ifdef _WIN32
 
-// steamclient64.dll RVAs (IDA image base: 0x138000000)
+// steamclient64.dll RVAs (IDA image base: 0x138000000, build 1782344391)
 
-// Global CSteamEngine* pointer. Same global already used by cloud_intercept.
-// (SC_RVA_GLOBAL_ENGINE = 0x17A70E8 in that module.)
-static constexpr uintptr_t SC_RVA_GLOBAL_ENGINE = 0x17C2D08;
+// Global CSteamEngine* pointer. Same global used by cloud_intercept.
+static constexpr uintptr_t SC_RVA_GLOBAL_ENGINE = 0x17CC738;
 
-// Offset from *qword_1397A70E8 to the CAppInfoCache instance.
+// Offset from *CSteamEngine to the CAppInfoCache instance.
 // Pattern observed in many callers:
-//   mov rbx, cs:qword_1397A70E8
+//   mov rbx, cs:qword_1397CC738
 //   lea rcx, [rbx + 0xE68]   ; 0xE68 = 3688
 //   call CAppInfoCache::BlockOnInitialization
 static constexpr uintptr_t APPINFOCACHE_OFFSET = 0xE68;
 
-// CAppInfoCache::GetAppInfo(appId) -> appInfo*
-static constexpr uintptr_t SC_RVA_GET_APP_INFO = 0x49D9C0;
+// CAppInfoCache::GetAppInfo(cache, appId) -> appInfo*
+static constexpr uintptr_t SC_RVA_GET_APP_INFO = 0x4A2370;
 
 // CAppInfoCache::GetSection(appInfo, sectionId) -> KeyValues*
 // sectionId 10 = "ufs"
-static constexpr uintptr_t SC_RVA_GET_SECTION = 0x49FCF0;
+static constexpr uintptr_t SC_RVA_GET_SECTION = 0x4A46A0;
 
 // CAppInfoCache::ReadAppConfigUint64(cache, appId, sectionId, keyName, defaultVal)
-static constexpr uintptr_t SC_RVA_READ_CONFIG_U64 = 0x49EA30;
+static constexpr uintptr_t SC_RVA_READ_CONFIG_U64 = 0x4A33E0;
 
 // BlockOnInit -- calls CThread::Join off-engine-thread, crashes/deadlocks. Do not call.
 // Cache is already loaded before our RPC handlers run.
@@ -62,22 +61,22 @@ static constexpr uintptr_t SC_RVA_READ_CONFIG_U64 = 0x49EA30;
 
 // KeyValues::FindKey(parent, name, bCreate, out)
 // When bCreate=1 creates the key if not present.
-static constexpr uintptr_t SC_RVA_KV_FIND_KEY = 0xCFA7F0;
+static constexpr uintptr_t SC_RVA_KV_FIND_KEY = 0xD01190;
 
 // KeyValues::GetUint64(kv, defaultVal, key)
-static constexpr uintptr_t SC_RVA_KV_GET_UINT64 = 0xCFBB40;
+static constexpr uintptr_t SC_RVA_KV_GET_UINT64 = 0xD024E0;
 
 // KeyValues::GetInt(kv, defaultVal, key)
-static constexpr uintptr_t SC_RVA_KV_GET_INT = 0xCFB6F0;
+static constexpr uintptr_t SC_RVA_KV_GET_INT = 0xD02090;
 
 // KeyValues::SetUint64(kv, value)
-static constexpr uintptr_t SC_RVA_KV_SET_UINT64 = 0xCFBDB0;
+static constexpr uintptr_t SC_RVA_KV_SET_UINT64 = 0xD02750;
 
 // KeyValues::SetInt(kv, value)
-static constexpr uintptr_t SC_RVA_KV_SET_INT = 0xCFBDF0;
+static constexpr uintptr_t SC_RVA_KV_SET_INT = 0xD02790;
 
 // KeyValues::SetString(kv, value) -- sets string value on a KV leaf node
-static constexpr uintptr_t SC_RVA_KV_SET_STRING = 0xCFBE30;
+static constexpr uintptr_t SC_RVA_KV_SET_STRING = 0xD027D0;
 
 // CAppInfoUpdater::RequestAppInfoUpdate -- not yet wired (offset unconfirmed).
 // Steam's background PICS populates KV on its own schedule; cached values suffice.
@@ -96,7 +95,7 @@ using KvSetIntFn = void (__fastcall*)(void* kvNode, int value);
 using KvSetStringFn = void (__fastcall*)(void* kvNode, const char* value);
 
 struct Resolved {
-    void** globalEnginePtrPtr = nullptr; // address of qword_1397A70E8 (a void**)
+    void** globalEnginePtrPtr = nullptr; // address of qword_1397CC738 (CSteamEngine*)
     GetAppInfoFn     getAppInfo = nullptr;
     GetSectionFn     getSection = nullptr;
     ReadConfigU64Fn  readConfigU64 = nullptr;
