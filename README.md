@@ -54,19 +54,14 @@ That's it. Go launch Steam and watch the magic.
 
 ## Usage (Linux)
 
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Deadboy666/h3adcr-b/refs/heads/cr-testbranch/headcrab.sh" | bash
-```
+Edit your SLSsteam config, set DisableCloud to No. 
 
-Followed by 
 
-```bash
-curl -fsSL headcrab.pages.dev/cloudredirect | bash
-```
+```curl -fsSL headcrab.pages.dev | bash```
 
 Open the CloudRedirect app, sign into a provider.
 
-Edit your SLS config. The games you want to sync must be specified under AdditionalApps in your SLS config. This requirement will go away in the future. Make sure DisableCloud is set to No in the config.
+Edit your SLS config. The games you want to sync must be specified under AdditionalApps in your SLS config. This requirement will go away in the future. 
 
 Now launch Steam and watch your games sync!
 
